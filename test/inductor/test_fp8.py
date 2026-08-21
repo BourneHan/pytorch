@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 
+import contextlib
 import functools
 import unittest
 from unittest import mock
@@ -2215,8 +2216,10 @@ class TestE8M0Log2PatternBitManip(TestCase):
     "ROCm-specific TDM host-side test; no TDM-capable device required",
 )
 class TestTDMScaled(TestCase):
-    def test_tdm_scaled_gate_admits_ocp_fp8_and_rejects_fnuz(self):
-        from torch._inductor.utils import use_triton_tdm_scaled_template
+    @staticmethod
+    @contextlib.contextmanager
+    def _tdm_capable_graph():
+        """Everything outside the operand rules says yes, so the rules decide."""
         from torch._inductor.virtualized import V
 
         class FakeSizeVars:
@@ -2232,32 +2235,55 @@ class TestTDMScaled(TestCase):
             def statically_known_multiple_of(expr, val):
                 return expr % val == 0
 
-        def make_mat(name, dtype, stride):
-            mat = mock.Mock()
-            mat.get_device.return_value = torch.device("cuda")
-            mat.get_dtype.return_value = dtype
-            mat.get_size.return_value = [128, 256]
-            mat.get_stride.return_value = stride
-            mat.get_name.return_value = name
-            mat.get_layout.return_value = mock.Mock(offset=0)
-            return mat
-
         fake_graph = mock.Mock(sizevars=FakeSizeVars(), unaligned_buffers=set())
         with (
             V.set_graph_handler(fake_graph),
             mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
         ):
+            yield
+
+    @staticmethod
+    def _make_mat(name, dtype, stride):
+        mat = mock.Mock()
+        mat.get_device.return_value = torch.device("cuda")
+        mat.get_dtype.return_value = dtype
+        mat.get_size.return_value = [128, 256]
+        mat.get_stride.return_value = stride
+        mat.get_name.return_value = name
+        mat.get_layout.return_value = mock.Mock(offset=0)
+        return mat
+
+    def _ocp_fp8_pair(self, dtype=torch.float8_e4m3fn):
+        return (
+            self._make_mat("A", dtype, [256, 1]),
+            self._make_mat("B", dtype, [1, 256]),
+        )
+
+    def test_tdm_scaled_admission_is_blocked(self):
+        # Discriminating by construction: the same operands are fed to both
+        # calls, and the operand rules accept them. Only the block makes the
+        # public gate disagree, so lifting the block fails this test rather
+        # than quietly passing it. If that happens, confirm the Triton pin
+        # carries triton-lang/triton#11313 first.
+        from torch._inductor import utils as inductor_utils
+
+        self.assertTrue(inductor_utils._TDM_SCALED_TEMPLATE_BLOCKED)
+        with self._tdm_capable_graph():
+            admissible = self._ocp_fp8_pair()
+            self.assertTrue(inductor_utils._tdm_scaled_operands_supported(*admissible))
+            self.assertFalse(inductor_utils.use_triton_tdm_scaled_template(*admissible))
+
+    def test_tdm_scaled_operand_rules_admit_ocp_fp8_and_reject_fnuz(self):
+        from torch._inductor.utils import _tdm_scaled_operands_supported
+
+        with self._tdm_capable_graph():
             for dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                 self.assertTrue(
-                    use_triton_tdm_scaled_template(
-                        make_mat("A", dtype, [256, 1]),
-                        make_mat("B", dtype, [1, 256]),
-                    )
+                    _tdm_scaled_operands_supported(*self._ocp_fp8_pair(dtype))
                 )
             self.assertFalse(
-                use_triton_tdm_scaled_template(
-                    make_mat("A", torch.float8_e4m3fnuz, [256, 1]),
-                    make_mat("B", torch.float8_e4m3fnuz, [1, 256]),
+                _tdm_scaled_operands_supported(
+                    *self._ocp_fp8_pair(torch.float8_e4m3fnuz)
                 )
             )
 
@@ -2280,6 +2306,19 @@ class TestTDMScaled(TestCase):
                 mm_kernel._use_scaled_descriptor_template(mat_a, mat_b, layout)
             )
             tdm_gate.assert_called_once_with(mat_a, mat_b, add_guards=True)
+
+    def test_scaled_descriptor_not_selected_on_hip(self):
+        # Same routing as above, but through the real gate: no scaled operand
+        # reaches a descriptor template on HIP while the block is in place, so
+        # scaled_mm falls back to the ordinary templates.
+        from torch._inductor.kernel import mm as mm_kernel
+
+        with mock.patch("torch.version.hip", "7.14"):
+            self.assertFalse(
+                mm_kernel._use_scaled_descriptor_template(
+                    mock.Mock(), mock.Mock(), mock.Mock()
+                )
+            )
 
     def test_tdm_scaled_config_policy(self):
         from torch._inductor.heuristics.template.triton import (
@@ -2378,36 +2417,41 @@ class TestTDMScaled(TestCase):
     "requires gfx1250 with ROCm 7.14+ and TDM-capable Triton",
 )
 class TestTDMScaledEndToEnd(TestCase):
-    """Real-device scaled TDM coverage.
+    """Real-device proof that scaled TDM stays unadmitted, and that the
+    fallback it defers to is numerically correct.
 
-    KNOWN FAILING on gfx1250. Both tests reach the correctness assertion and
-    fail there: the scaled TDM kernel returns an all-zero result. The codegen
-    assertions above it pass -- descriptors are emitted, the template compiles
-    and autotunes -- so "``make_tensor_descriptor`` appears in the output" is
-    NOT evidence that this path is correct. Measured on gfx1250 with ROCm/HIP
-    7.16 and Triton 3.8, ``_scaled_mm`` at 256x256x256:
+    Scaled admission is blocked in ``torch/_inductor/utils.py``; see the note
+    on ``_TDM_SCALED_TEMPLATE_BLOCKED``. The defect is in Triton, and it is
+    neither a descriptor nor an FP8 problem: the template derives
+    ``tiles_per_SM`` from ``program_id`` and performs its output store inside a
+    loop-tail conditional, and Triton's integer range analysis eliminates that
+    store. The output buffer is then left *unwritten*, so what a caller
+    observes depends on allocator contents rather than being reliably zero.
+    ``num_tiles < NUM_SMS`` is the configuration that exposes it. See
+    triton-lang/triton#11313. Dense (``TestTDMEndToEnd``) and flex TDM are
+    unaffected: their stores sit outside the K loop rather than under such a
+    conditional.
 
-        enable_tdm=False -> max abs error 0.17 (bf16 rounding)
-        enable_tdm=True  -> 0 of 65536 output elements non-zero
+    These tests assert the *absence* of descriptors rather than their presence,
+    because presence never established correctness in the first place. An
+    earlier formulation of this class compiled, autotuned and emitted
+    ``make_tensor_descriptor`` while returning an all-zero result -- 0 of 65536
+    output elements non-zero, against a max abs error of 0.17 from bf16
+    rounding with ``enable_tdm=False``. When the block is lifted, restore
+    positive coverage with a sentinel-filled output and a shape where
+    ``num_tiles < NUM_SMS``; a passing 256x256x256 case does not reach the bug.
 
-    Reproduced with scales of both 1x1 and 2x3, so it is not a scale-magnitude
-    issue. Dense (``TestTDMEndToEnd``) and flex TDM pass on the same build, so
-    this is specific to the scaled/FP8 descriptor path; the suspected cause is
-    TDM descriptors over 1-byte (FP8) elements.
+    Two deliberate deviations from the obvious formulation, both still needed
+    to reach the correctness assertion:
 
-    Two deliberate deviations from the obvious formulation, both required just
-    to reach that assertion:
-
-    * Row-wise rather than tensor-wise scales. Both recipes live in
-      ``epilogue_scaling_types`` and select the same descriptor template, so
-      the TDM path under test is unchanged. But tensor-wise scales are rank-1,
-      and ``max_autotune`` also builds the plain ``mm_template`` choice, whose
-      ``store_output`` loads every epilogue input with the output's 2D index --
-      that combination raises inside ``FixedLayout`` indexing before any TDM
-      code runs, and does so with ``enable_tdm=False`` too. Note that
-      ``test_configs.autotune_choice_name_regex`` cannot avoid it, because
-      ``filter_choices_by_name_regex`` runs over already-constructed choices
-      while the failure happens during construction.
+    * Row-wise rather than tensor-wise scales. Tensor-wise scales are rank-1,
+      and ``max_autotune`` builds the plain ``mm_template`` choice -- the very
+      fallback under test here -- whose ``store_output`` loads every epilogue
+      input with the output's 2D index. That combination raises inside
+      ``FixedLayout`` indexing during choice *construction*, with
+      ``enable_tdm=False`` too, so ``test_configs.autotune_choice_name_regex``
+      cannot filter it away: ``filter_choices_by_name_regex`` runs over
+      already-constructed choices.
 
     * An fp32 recomputation, rather than the eager op, as the oracle. Eager
       ``_scaled_mm`` dispatches to hipBLASLt, which has no row-wise FP8
@@ -2423,16 +2467,19 @@ class TestTDMScaledEndToEnd(TestCase):
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=2e-2)
 
     def _compile_and_get_code(self, fn, *args):
-        with config.patch(
-            {
-                "max_autotune": True,
-                "triton.enable_tdm": True,
-                "test_configs.autotune_choice_name_regex": "scaled_mm_device_tma",
-            }
-        ):
+        # No autotune_choice_name_regex: the descriptor templates are expected
+        # to contribute no choices now, and filtering to them would leave the
+        # selector with an empty candidate list.
+        with config.patch({"max_autotune": True, "triton.enable_tdm": True}):
             return run_and_get_code(torch.compile(fn), *args)
 
-    def test_tdm_scaled_mm_legacy_correctness_and_selection(self):
+    def _assert_no_descriptors_and_correct(self, result, code, a, b, scale_a, scale_b):
+        joined = "\n".join(code)
+        self.assertNotIn("make_tensor_descriptor", joined)
+        self.assertNotIn("load_tensor_descriptor", joined)
+        self._assert_close_to_reference(result, a, b, scale_a, scale_b)
+
+    def test_tdm_scaled_mm_legacy_is_not_admitted(self):
         def fn(a, b, scale_a, scale_b):
             return torch._scaled_mm(
                 a,
@@ -2447,12 +2494,9 @@ class TestTDMScaledEndToEnd(TestCase):
         scale_a = torch.ones(256, 1, device=GPU_TYPE)
         scale_b = torch.ones(1, 256, device=GPU_TYPE)
         result, code = self._compile_and_get_code(fn, a, b, scale_a, scale_b)
-        joined = "\n".join(code)
-        self.assertIn("make_tensor_descriptor", joined)
-        self.assertIn("load_tensor_descriptor", joined)
-        self._assert_close_to_reference(result, a, b, scale_a, scale_b)
+        self._assert_no_descriptors_and_correct(result, code, a, b, scale_a, scale_b)
 
-    def test_tdm_scaled_mm_v2_correctness_and_selection(self):
+    def test_tdm_scaled_mm_v2_is_not_admitted(self):
         def fn(a, b, scale_a, scale_b):
             return scaled_mm(
                 a,
@@ -2469,10 +2513,7 @@ class TestTDMScaledEndToEnd(TestCase):
         scale_a = torch.ones(256, 1, device=GPU_TYPE)
         scale_b = torch.ones(1, 256, device=GPU_TYPE)
         result, code = self._compile_and_get_code(fn, a, b, scale_a, scale_b)
-        joined = "\n".join(code)
-        self.assertIn("make_tensor_descriptor", joined)
-        self.assertIn("load_tensor_descriptor", joined)
-        self._assert_close_to_reference(result, a, b, scale_a, scale_b)
+        self._assert_no_descriptors_and_correct(result, code, a, b, scale_a, scale_b)
 
 
 instantiate_device_type_tests(TestFP8Types, globals(), allow_xpu=True)

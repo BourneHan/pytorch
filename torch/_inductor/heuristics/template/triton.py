@@ -79,10 +79,31 @@ def _use_template_autows() -> bool:
 IS_ROCM = torch.version.hip is not None
 
 
+def _tdm_descriptor_orientation(kwargs: dict[str, Any]) -> tuple[bool, bool]:
+    """Read the operand orientations that a TDM heuristic must have injected.
+
+    Fail closed rather than assuming row-major. Which tile extent is the
+    contiguous one depends on the orientation, so a wrong default silently
+    filters against the wrong axis and admits misaligned descriptor blocks
+    instead of raising.
+    """
+    missing = [
+        key for key in ("tdm_a_row_major", "tdm_b_row_major") if key not in kwargs
+    ]
+    if missing:
+        raise AssertionError(
+            f"TDM config filtering requires {', '.join(missing)}; they are "
+            "injected by the TDM template heuristics and must not be defaulted"
+        )
+    return kwargs["tdm_a_row_major"], kwargs["tdm_b_row_major"]
+
+
 def _tdm_block_aligned(block: int, dtype_size: int) -> bool:
     """Whether a tile's contiguous extent satisfies direct-path policy."""
     if dtype_size <= 0:
-        raise AssertionError(f"Expected positive dtype_size, got {dtype_size}")
+        raise AssertionError(
+            f"TDM config filtering requires a positive dtype_size, got {dtype_size}"
+        )
     return (int(block) * dtype_size) % _TDM_DIRECT_PATH_ALIGNMENT_BYTES == 0
 
 
@@ -1845,15 +1866,25 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         op_name: str = "mm",
         **kwargs,
     ) -> Generator[TritonConfig, None, None]:
+        tdm_report: tuple[int, int, bool, bool] | None = None
         if self.uses_tdm_configs:
-            a_row_major = kwargs.get("tdm_a_row_major", True)
-            b_row_major = kwargs.get("tdm_b_row_major", True)
+            # Validate before filtering, not from inside the per-config
+            # predicate: an already-empty pool would otherwise skip the check
+            # entirely and report success for metadata that is not usable.
+            a_row_major, b_row_major = _tdm_descriptor_orientation(kwargs)
+            if dtype_size <= 0:
+                raise AssertionError(
+                    "TDM config filtering requires a positive dtype_size, "
+                    f"got {dtype_size}"
+                )
+            candidate_count = len(configs)
             configs = _filter_tdm_descriptor_block_configs(
                 configs,
                 dtype_size,
                 a_row_major=a_row_major,
                 b_row_major=b_row_major,
             )
+            tdm_report = (candidate_count, dtype_size, a_row_major, b_row_major)
             caller_exclude = exclude
 
             def tdm_exclude(
@@ -1872,7 +1903,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
             exclude = tdm_exclude
 
-        return super().preprocess_mm_configs(
+        scaled = super().preprocess_mm_configs(
             m,
             n,
             k,
@@ -1884,6 +1915,41 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             op_name,
             **kwargs,
         )
+        if tdm_report is None:
+            return scaled
+        return self._report_empty_tdm_pool(scaled, *tdm_report)
+
+    @staticmethod
+    def _report_empty_tdm_pool(
+        configs: Generator[TritonConfig, None, None],
+        candidate_count: int,
+        dtype_size: int,
+        a_row_major: bool,
+        b_row_major: bool,
+    ) -> Generator[TritonConfig, None, None]:
+        """Warn when descriptor alignment leaves a TDM template with no configs.
+
+        Counted here rather than straight after the block filter because
+        ``_scale_mm_configs`` clamps block sizes to the problem's shape hints
+        and only then re-applies ``tdm_exclude``: a config that satisfied the
+        128-byte policy at full size can still be dropped once a small K
+        clamps ``BLOCK_K``. Without this the template contributes nothing and
+        the graph looks as though TDM had never been admitted at all.
+        """
+        surviving = 0
+        for config in configs:
+            surviving += 1
+            yield config
+        if not surviving:
+            log.warning(
+                "TDM: descriptor block alignment left no usable configs out of "
+                "%d candidates (dtype_size=%d, a_row_major=%s, b_row_major=%s); "
+                "this template contributes no autotuning choices",
+                candidate_count,
+                dtype_size,
+                a_row_major,
+                b_row_major,
+            )
 
     def _prune_exhaustive_configs(
         self,
@@ -2483,12 +2549,13 @@ class MMTemplateConfigMixin(GemmMaxAutotuneTemplateConfigHeuristics):
             # Revalidate the reconstructed Origami tiles. The candidate pool was
             # filtered above, but selected results are rebuilt as GemmConfig objects.
             if self.uses_tdm_configs:
+                a_row_major, b_row_major = _tdm_descriptor_orientation(kwargs)
                 origami_config_count = len(origami_configs)
                 origami_configs = _filter_tdm_descriptor_block_configs(
                     origami_configs,
                     dtype.itemsize,
-                    a_row_major=kwargs.get("tdm_a_row_major", True),
-                    b_row_major=kwargs.get("tdm_b_row_major", True),
+                    a_row_major=a_row_major,
+                    b_row_major=b_row_major,
                 )
                 pruned = origami_config_count - len(origami_configs)
                 if pruned:
@@ -3049,6 +3116,52 @@ class BaseScaledMMConfigMixin(MMTemplateConfigMixin):
             yield template_kwargs
 
 
+class MainLoopScalingConfigMixin(BaseScaledMMConfigMixin):
+    """Tile-size options shared by every main-loop-scaling scaled MM template.
+
+    The values depend only on the scaling recipe and the selected block sizes,
+    so CUDA TMA and ROCm TDM derive them identically; keep them in one place
+    rather than in a per-backend copy.
+    """
+
+    def _get_template_configs_impl(
+        self,
+        kernel_inputs: KernelInputs,
+        op_name: str,
+        **kwargs,
+    ) -> Generator[dict[str, Any], None, None]:
+        mat_a, mat_b, scale_a, scale_b = kernel_inputs._input_nodes
+        scale_option_a, scale_option_b = get_scaling_options(
+            mat_a, mat_b, scale_a.get_size(), scale_b.get_size()
+        )
+        tile_size_a = get_tile_size(scale_option_a)
+        tile_size_b = get_tile_size(scale_option_b)
+
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name, **kwargs
+        ):
+            # Inductor templates require compile-time constants passed in as
+            # tl.constexpr values. When a block size (BLOCK_*) is smaller than
+            # the tile size (128, 32, 16), scales must be broadcast to BLOCK_*
+            # rather than to a tile_size x tile_size chunk.
+            template_kwargs["TILE_SIZE_A"] = tile_size_a
+            template_kwargs["TILE_SIZE_B"] = tile_size_b
+            template_kwargs["MIN_BLOCK_TILE_AM"] = min(
+                template_kwargs["BLOCK_M"], tile_size_a
+            )
+            template_kwargs["MIN_BLOCK_TILE_AK"] = min(
+                template_kwargs["BLOCK_K"], tile_size_a
+            )
+            template_kwargs["MIN_BLOCK_TILE_BK"] = min(
+                template_kwargs["BLOCK_K"], tile_size_b
+            )
+            template_kwargs["MIN_BLOCK_TILE_BN"] = min(
+                template_kwargs["BLOCK_N"], tile_size_b
+            )
+
+            yield template_kwargs
+
+
 class ScaledMMConfigMixin(BaseScaledMMConfigMixin):
     """Mixin for scaled mm with the regular mm template"""
 
@@ -3392,44 +3505,9 @@ class ROCmScaledTDMEpilogueScalingTemplateConfigHeuristic(
     op_name="scaled_mm",
 )
 class ROCmScaledTDMMainLoopScalingTemplateConfigHeuristic(
-    ROCmScaledTDMConfigMixin, ROCmConfigHeuristic
+    MainLoopScalingConfigMixin, ROCmScaledTDMConfigMixin, ROCmConfigHeuristic
 ):
     """gfx1250 scaled TDM heuristic for main-loop scaling."""
-
-    def _get_template_configs_impl(
-        self,
-        kernel_inputs: KernelInputs,
-        op_name: str,
-        **kwargs,
-    ) -> Generator[dict[str, Any], None, None]:
-        mat_a, mat_b, scale_a, scale_b = kernel_inputs._input_nodes
-        scale_option_a, scale_option_b = get_scaling_options(
-            mat_a,
-            mat_b,
-            scale_a.get_size(),
-            scale_b.get_size(),
-        )
-        tile_size_a = get_tile_size(scale_option_a)
-        tile_size_b = get_tile_size(scale_option_b)
-
-        for template_kwargs in super()._get_template_configs_impl(
-            kernel_inputs, op_name, **kwargs
-        ):
-            template_kwargs["TILE_SIZE_A"] = tile_size_a
-            template_kwargs["TILE_SIZE_B"] = tile_size_b
-            template_kwargs["MIN_BLOCK_TILE_AM"] = min(
-                template_kwargs["BLOCK_M"], tile_size_a
-            )
-            template_kwargs["MIN_BLOCK_TILE_AK"] = min(
-                template_kwargs["BLOCK_K"], tile_size_a
-            )
-            template_kwargs["MIN_BLOCK_TILE_BK"] = min(
-                template_kwargs["BLOCK_K"], tile_size_b
-            )
-            template_kwargs["MIN_BLOCK_TILE_BN"] = min(
-                template_kwargs["BLOCK_N"], tile_size_b
-            )
-            yield template_kwargs
 
 
 @register_template_heuristic(
@@ -3521,7 +3599,7 @@ class CUDAScaledTMAEpilogueScalingTemplateConfigHeuristic(
     op_name="scaled_mm",
 )
 class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
-    ScaledTMAConfigMixin, CUDAConfigHeuristic
+    MainLoopScalingConfigMixin, ScaledTMAConfigMixin, CUDAConfigHeuristic
 ):
     """
     Scaled TMA template heuristic for CUDA:
@@ -3532,54 +3610,6 @@ class CUDAScaledTMAMainLoopScalingTemplateConfigHeuristic(
         super().__init__()
         # Override mm_configs to use scaled_persistent_mm_configs for TMA
         self.mm_configs = self.scaled_persistent_mm_configs
-
-    def _get_template_configs_impl(
-        self,
-        kernel_inputs: KernelInputs,
-        op_name: str,
-        **kwargs,
-    ) -> Generator[dict[str, Any], None, None]:
-        """
-        Generate main loop scaling kernel inputs.
-        """
-        mat_a, mat_b, scale_a, scale_b = kernel_inputs._input_nodes
-        scale_a_size, scale_b_size = scale_a.get_size(), scale_b.get_size()
-
-        scale_option_a, scale_option_b = get_scaling_options(
-            mat_a, mat_b, scale_a_size, scale_b_size
-        )
-        tile_size_a = get_tile_size(scale_option_a)
-        tile_size_b = get_tile_size(scale_option_b)
-
-        # Get base scaled MM template configs from superclass
-        for template_kwargs in super()._get_template_configs_impl(
-            kernel_inputs,
-            op_name,
-            **kwargs,
-        ):
-            # Add scaling-specific options for main loop scaling variants
-
-            # Inductor templates require compile-time constants passed in as tl.constexpr values.
-            # In cases in which the block size (BLOCK_*) is smaller than the tile size (128, 32, 16),
-            # scales must be broadcasted to BLOCK_* (rather than to a tile_sizextile_size chunk).
-
-            template_kwargs["TILE_SIZE_A"] = tile_size_a
-            template_kwargs["TILE_SIZE_B"] = tile_size_b
-
-            template_kwargs["MIN_BLOCK_TILE_AM"] = min(
-                template_kwargs["BLOCK_M"], tile_size_a
-            )
-            template_kwargs["MIN_BLOCK_TILE_AK"] = min(
-                template_kwargs["BLOCK_K"], tile_size_a
-            )
-            template_kwargs["MIN_BLOCK_TILE_BK"] = min(
-                template_kwargs["BLOCK_K"], tile_size_b
-            )
-            template_kwargs["MIN_BLOCK_TILE_BN"] = min(
-                template_kwargs["BLOCK_N"], tile_size_b
-            )
-
-            yield template_kwargs
 
 
 @register_template_heuristic(

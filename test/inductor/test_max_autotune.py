@@ -5793,19 +5793,45 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         supports_tdm.assert_called_once_with("gfx1250")
 
     def test_tdm_template_rejects_descriptor_shapes_exceeding_int32(self):
+        # Bare mocks cannot express this: get_dtype() would return a Mock, the
+        # gate would reject at the dtype check, and the assertion below would
+        # pass without the int32 bound ever being consulted. Use real layouts
+        # and pair the rejection with an in-range control.
         from torch._inductor.utils import use_triton_tdm_template
 
         int32_max = torch.iinfo(torch.int32).max
-        mat1 = mock.Mock()
-        mat1.get_device.return_value = torch.device("cuda")
-        mat1.get_size.return_value = [128, int32_max + 1]
-        mat2 = mock.Mock()
-        mat2.get_size.return_value = [int32_max + 1, 128]
+        graph = GraphLowering(make_fx(lambda: torch.zeros(2, 3))())
 
-        with mock.patch(
-            "torch._inductor.utils._gfx1250_tdm_enabled", return_value=True
+        def make_mat(name, size):
+            # Row-major, 128-byte-aligned outer stride, zero offset: the extent
+            # is the only property that can decide admission.
+            return Buffer(
+                name=name,
+                layout=FixedLayout(
+                    torch.device("cuda"),
+                    torch.float16,
+                    size,
+                    (size[1], 1),
+                    0,
+                ),
+            )
+
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
         ):
-            self.assertFalse(use_triton_tdm_template(mat1, mat2))
+            self.assertTrue(
+                use_triton_tdm_template(
+                    make_mat("in_range_a", (128, 64)),
+                    make_mat("in_range_b", (64, 128)),
+                )
+            )
+            self.assertFalse(
+                use_triton_tdm_template(
+                    make_mat("oversized_a", (128, int32_max + 1)),
+                    make_mat("oversized_b", (int32_max + 1, 128)),
+                )
+            )
 
     def test_tdm_template_checks_alignment_and_offset(self):
         from torch._dynamo.source import ConstantSource
@@ -5996,6 +6022,40 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             ],
             [(64, 64, 64)],
         )
+
+    def test_tdm_config_filtering_requires_injected_orientation(self):
+        # Defaulting the orientation would silently filter tiles against the
+        # wrong contiguous extent and admit misaligned descriptor blocks, so a
+        # caller that reaches a uses_tdm_configs heuristic without going
+        # through one must fail loudly instead.
+        from torch._inductor.heuristics.template.triton import (
+            _tdm_descriptor_orientation,
+            ROCmPersistentTDMTemplateConfigHeuristic,
+        )
+
+        self.assertEqual(
+            _tdm_descriptor_orientation(
+                {"tdm_a_row_major": False, "tdm_b_row_major": True}
+            ),
+            (False, True),
+        )
+        for incomplete in ({}, {"tdm_a_row_major": True}, {"tdm_b_row_major": True}):
+            with self.assertRaisesRegex(AssertionError, "tdm_._row_major"):
+                _tdm_descriptor_orientation(incomplete)
+
+        heuristic = ROCmPersistentTDMTemplateConfigHeuristic()
+        self.assertTrue(heuristic.uses_tdm_configs)
+        with self.assertRaisesRegex(AssertionError, "tdm_._row_major"):
+            next(
+                heuristic.preprocess_mm_configs(
+                    128,
+                    128,
+                    128,
+                    heuristic.persistent_mm_configs,
+                    dtype_size=2,
+                    op_name="mm",
+                )
+            )
 
     def test_persistent_descriptor_source_uses_stable_api(self):
         from torch._inductor.kernel.mm_common import load_kernel_template

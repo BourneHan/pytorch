@@ -170,12 +170,24 @@ ALIGNMENT = 16
 TMA_ALIGNMENT = 16
 TMA_DESCRIPTOR_SIZE = 128
 
-# Triton requires 16-byte descriptor base/row alignment and an innermost block
-# extent of at least 16 bytes.
-_TDM_REQUIRED_ALIGNMENT_BYTES = TMA_ALIGNMENT
+# Descriptor legality. This is the only alignment-shaped rule Triton actually
+# enforces: `make_tensor_descriptor` checks rank 1-5, a unit innermost stride,
+# and an innermost *block* extent of at least 16 bytes. Nothing below it is a
+# hardware correctness requirement.
+_TDM_MIN_INNERMOST_REQUEST_BYTES = TMA_ALIGNMENT
 
-# Current TDM templates select only layouts expected to use the 128-byte direct
-# request path. This is a performance policy, not descriptor correctness.
+# Inductor policy on operand storage offset and outer strides, matching the
+# 16-byte descriptor contract Triton documents but does not verify. Conservative
+# rather than required: it constrains where an operand may start and does not
+# establish the absolute alignment of the base pointer.
+_TDM_OPERAND_ALIGNMENT_BYTES = TMA_ALIGNMENT
+
+# Inductor *performance* policy, not correctness. A descriptor that is 16-byte
+# but not 128-byte aligned still compiles and still produces correct results; it
+# only forgoes the direct L2->LDS path. Two consequences worth keeping in view:
+# the check is relative (outer stride and block width), so it never proves that
+# a tile begins at a 128-byte absolute address, and it turns away shapes that
+# would have worked -- FP16 with head_dim 32 is 64 bytes and is rejected here.
 _TDM_DIRECT_PATH_ALIGNMENT_BYTES = 128
 _TDM_SUPPORTED_DTYPES: OrderedSet[torch.dtype] = OrderedSet(
     [torch.float16, torch.bfloat16, torch.float32]
@@ -2212,14 +2224,16 @@ def _tdm_operand_compatible(
     def aligned(expr: sympy.Expr, alignment: int) -> bool:
         return V.graph.sizevars.statically_known_multiple_of(expr, alignment)
 
-    # Descriptor correctness. The innermost block extent is checked by the
-    # template config filter, not by constraining the logical tensor extent.
-    if not aligned(offset * itemsize, _TDM_REQUIRED_ALIGNMENT_BYTES):
+    # Operand policy. The innermost block extent -- the one rule Triton
+    # enforces -- is checked by the template config filter, not by constraining
+    # the logical tensor extent here.
+    if not aligned(offset * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
-    if not aligned(strides_i[outer_idx] * itemsize, _TDM_REQUIRED_ALIGNMENT_BYTES):
+    if not aligned(strides_i[outer_idx] * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
 
-    # Performance policy: select only rows expected to use the direct path.
+    # Inductor selection policy: relative 128-byte row alignment. See the note
+    # on _TDM_DIRECT_PATH_ALIGNMENT_BYTES -- this does not prove direct-path use.
     return aligned(strides_i[outer_idx] * itemsize, _TDM_DIRECT_PATH_ALIGNMENT_BYTES)
 
 
@@ -2270,14 +2284,41 @@ def use_triton_tdm_template(
     return _tdm_operands_compatible(matrices, _TDM_SUPPORTED_DTYPES, add_guards)
 
 
+def _tdm_scaled_operands_supported(
+    *matrices: IRNode,
+    add_guards: bool = False,
+) -> bool:
+    """Whether scaled FP8 MM operands satisfy the gfx1250 TDM descriptor rules."""
+    if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
+        return False
+    return _tdm_operands_compatible(matrices, _TDM_SCALED_SUPPORTED_DTYPES, add_guards)
+
+
+# The persistent scaled template derives its tile count from `program_id` and
+# performs its output store inside a loop-tail conditional. Triton's integer
+# range analysis eliminates that store, so the output buffer is left unwritten
+# and what a caller observes depends on allocator contents rather than being
+# reliably zero. Silent wrong results are not acceptable even behind an opt-in
+# flag, so keep scaled admission off until
+# https://github.com/triton-lang/triton/pull/11313 (or an equivalent rewrite of
+# the template's control flow) is in the supported Triton branch and the pin
+# has advanced. `num_tiles < NUM_SMS` is the configuration that exposes it.
+_TDM_SCALED_TEMPLATE_BLOCKED: bool = True
+
+
 def use_triton_tdm_scaled_template(
     *matrices: IRNode,
     add_guards: bool = False,
 ) -> bool:
-    """Return whether scaled FP8 MM operands may use gfx1250 TDM descriptors."""
-    if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
+    """Return whether scaled FP8 MM operands may use gfx1250 TDM descriptors.
+
+    Always False while ``_TDM_SCALED_TEMPLATE_BLOCKED`` is set; see the note
+    there for why. The operand rules stay live and tested underneath it so that
+    lifting the block is a one-line change rather than a rewrite.
+    """
+    if _TDM_SCALED_TEMPLATE_BLOCKED:
         return False
-    return _tdm_operands_compatible(matrices, _TDM_SCALED_SUPPORTED_DTYPES, add_guards)
+    return _tdm_scaled_operands_supported(*matrices, add_guards=add_guards)
 
 
 def use_gfx1250_descriptor_codegen(device: torch.device | None) -> bool:
@@ -2305,12 +2346,14 @@ def use_flex_tdm_descriptor(
     elif len(block_shapes) != len(matrices):
         raise AssertionError("Expected one block shape per flex descriptor operand")
 
-    def operand_compatible(
+    def _reject(mat: IRNode, reason: str) -> bool:
+        log.debug("Flex TDM descriptor rejected for %s: %s", mat.get_name(), reason)
+        return False
+
+    def operand_admissible(
         mat: IRNode, block_shape: Sequence[sympy.Expr | int]
     ) -> bool:
-        def reject(reason: str) -> bool:
-            log.debug("Flex TDM descriptor rejected for %s: %s", mat.get_name(), reason)
-            return False
+        reject = functools.partial(_reject, mat)
 
         if mat.get_dtype() not in _TDM_SUPPORTED_DTYPES:
             return reject(f"unsupported dtype {mat.get_dtype()}")
@@ -2330,12 +2373,13 @@ def use_flex_tdm_descriptor(
         def aligned(expr: sympy.Expr | int, alignment: int) -> bool:
             return V.graph.sizevars.statically_known_multiple_of(expr, alignment)
 
-        # Correctness: Triton's shared descriptor contract -- unit last stride, a
-        # 16-byte-aligned base, and an innermost block extent of at least 16 bytes.
+        # Unit last stride and the >=16-byte innermost request below are the
+        # rules Triton enforces; the 16-byte offset check between them is
+        # Inductor policy (see the constants above).
         if not V.graph.sizevars.statically_known_equals(strides[-1], 1):
             return reject("innermost stride is not statically known to be one")
-        if not aligned(offset * itemsize, _TDM_REQUIRED_ALIGNMENT_BYTES):
-            return reject(f"offset is not {_TDM_REQUIRED_ALIGNMENT_BYTES}-byte aligned")
+        if not aligned(offset * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
+            return reject(f"offset is not {_TDM_OPERAND_ALIGNMENT_BYTES}-byte aligned")
 
         if block_shape and len(block_shape) != 2:
             return reject("expected a two-dimensional block shape")
@@ -2344,43 +2388,50 @@ def use_flex_tdm_descriptor(
         # when the caller supplies one, else the full innermost dimension.
         innermost = block_shape[-1] if block_shape else sizes[-1]
         if not V.graph.sizevars.statically_known_geq(
-            innermost * itemsize, _TDM_REQUIRED_ALIGNMENT_BYTES
+            innermost * itemsize, _TDM_MIN_INNERMOST_REQUEST_BYTES
         ):
             return reject(
                 "innermost request extent is not statically known to hold at "
-                f"least {_TDM_REQUIRED_ALIGNMENT_BYTES} bytes"
+                f"least {_TDM_MIN_INNERMOST_REQUEST_BYTES} bytes"
             )
 
         if not all(
-            aligned(s * itemsize, _TDM_REQUIRED_ALIGNMENT_BYTES) for s in strides[:-1]
+            aligned(s * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES) for s in strides[:-1]
         ):
             return reject(
-                f"outer strides are not {_TDM_REQUIRED_ALIGNMENT_BYTES}-byte aligned"
+                f"outer strides are not {_TDM_OPERAND_ALIGNMENT_BYTES}-byte aligned"
             )
 
-        # Performance policy: current flex templates select only the direct path.
+        # Inductor selection policy: relative 128-byte alignment only. See the
+        # note on _TDM_DIRECT_PATH_ALIGNMENT_BYTES.
         if not all(
             aligned(s * itemsize, _TDM_DIRECT_PATH_ALIGNMENT_BYTES)
             for s in strides[:-1]
         ):
-            return reject("outer strides are not direct-path aligned")
+            return reject("outer strides are not 128-byte aligned")
         if block_shape and not aligned(
             block_shape[-1] * itemsize,
             _TDM_DIRECT_PATH_ALIGNMENT_BYTES,
         ):
-            return reject("block width is not direct-path aligned")
+            return reject("block width is not 128-byte aligned")
 
-        # Install bounds only after this operand passes its guard-free checks.
-        # These range guards do not pin dynamic sequence lengths to their
-        # current values.
-        if not _descriptor_shape_fits_in_int32(sizes, add_guards=True):
-            return reject("descriptor shape does not fit in int32")
         return True
 
-    return all(
-        operand_compatible(mat, block_shape)
+    # Admission is list-wide and guard-free, as it is for the MM templates in
+    # ``_tdm_operands_compatible``: rejecting a later operand must not leave the
+    # graph carrying range guards installed for an earlier one.
+    if not all(
+        operand_admissible(mat, block_shape)
         for mat, block_shape in zip(matrices, block_shapes)
-    )
+    ):
+        return False
+
+    # Bounds only; unlike specialization, this does not pin a dynamic sequence
+    # length to its current value.
+    for mat in matrices:
+        if not _descriptor_shape_fits_in_int32(mat.get_size(), add_guards=True):
+            return _reject(mat, "descriptor shape does not fit in int32")
+    return True
 
 
 def use_triton_tma_template(

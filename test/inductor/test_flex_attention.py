@@ -715,11 +715,15 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
             V.set_graph_handler(graph),
             mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
         ):
+            # Admission is list-wide, as it is for the MM templates: `value` is
+            # rejected, so the earlier-checked `query` and `key` must not be
+            # left carrying range guards for a descriptor that is never built.
             self.assertFalse(use_flex_tdm_descriptor(query, key, value))
-            self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before + 2)
+            self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before)
             graph.unaligned_buffers.remove("value")
             self.assertTrue(use_flex_tdm_descriptor(query, key, value))
 
+        # Only an admitted operand list installs bounds, one per operand.
         new_guards = graph.sizevars.shape_env.guards[guards_before:]
         int32_max = torch.iinfo(torch.int32).max
         self.assertEqual(len(new_guards), 3)

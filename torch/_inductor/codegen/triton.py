@@ -2996,35 +2996,41 @@ class TMACompatibilityChecker:
         If force, we allow relying on symbolic hints equivalent
         to what we check for Triton templates.
         """
-        device_type = V.graph.get_current_device_or_throw().type
+        device = V.graph.get_current_device_or_throw()
+        device_type = device.type
         if self.force:
             strides = [
                 V.graph.sizevars.replace_backed_symbols_with_hints(st)
                 for st in block_params.strides
+            ]
+            # Resolve the shape the same way as the strides, so that `force`
+            # keeps deciding on hints rather than rejecting every dynamic
+            # descriptor in the int32 range check below.
+            shape = [
+                V.graph.sizevars.replace_backed_symbols_with_hints(sz)
+                for sz in block_params.shape
             ]
             constant_offset_expr = V.graph.sizevars.replace_backed_symbols_with_hints(
                 sympy.sympify(constant_offset)
             )
         else:
             strides = block_params.strides
+            shape = block_params.shape
             constant_offset_expr = sympy.sympify(constant_offset)
 
-        using_tdm = use_gfx1250_descriptor_codegen(
-            V.graph.get_current_device_or_throw()
-        )
-        if using_tdm:
-            if not 1 <= len(block_params.shape) <= 5:
+        if use_gfx1250_descriptor_codegen(device):
+            if not 1 <= len(shape) <= 5:
                 log.debug(
                     "%s TDM descriptors require rank between 1 and 5. Shape is: %s",
                     self.failed_debug_prefix,
-                    block_params.shape,
+                    shape,
                 )
                 return False
-            if not _descriptor_shape_fits_in_int32(block_params.shape):
+            if not _descriptor_shape_fits_in_int32(shape):
                 log.debug(
                     "%s TDM descriptor dimensions must fit in int32. Shape is: %s",
                     self.failed_debug_prefix,
-                    block_params.shape,
+                    shape,
                 )
                 return False
 
