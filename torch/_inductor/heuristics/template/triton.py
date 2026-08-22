@@ -35,7 +35,8 @@ from ...kernel.mm_plus_mm import mm_plus_mm_template
 from ...kernel_inputs import KernelInputs, MMKernelInputs
 from ...runtime.hints import DeviceProperties
 from ...utils import (
-    _TDM_DIRECT_PATH_ALIGNMENT_BYTES,
+    _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES,
+    commit_tdm_operand_layout,
     get_backend_num_stages,
     get_default_kpack,
     get_num_sms,
@@ -104,7 +105,7 @@ def _tdm_block_aligned(block: int, dtype_size: int) -> bool:
         raise AssertionError(
             f"TDM config filtering requires a positive dtype_size, got {dtype_size}"
         )
-    return (int(block) * dtype_size) % _TDM_DIRECT_PATH_ALIGNMENT_BYTES == 0
+    return (int(block) * dtype_size) % _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES == 0
 
 
 def _tdm_descriptor_blocks_aligned(
@@ -3414,10 +3415,14 @@ class ROCmPersistentTDMTemplateConfigHeuristic(
             "tdm_a_row_major": a_row_major,
             "tdm_b_row_major": b_row_major,
         }
-        for template_kwargs in super()._get_template_configs_impl(
-            kernel_inputs, op_name, **kwargs
-        ):
-            yield {
+        # Materialize before committing. Admission only bounded these operands;
+        # every alignment filter, shape-hint scaling pass, Origami selection and
+        # backend/resource filter runs inside the call below, and any of them
+        # can empty the pool. Specializing the graph for a template that then
+        # contributes no choice is the defect this ordering exists to avoid.
+        generated = super()._get_template_configs_impl(kernel_inputs, op_name, **kwargs)
+        configs = [
+            {
                 **template_kwargs,
                 "A_ROW_MAJOR": a_row_major,
                 "B_ROW_MAJOR": b_row_major,
@@ -3425,6 +3430,19 @@ class ROCmPersistentTDMTemplateConfigHeuristic(
                 # The TDM capability gate requires make_tensor_descriptor.
                 "TMA_EXPERIMENTAL_API": False,
             }
+            for template_kwargs in generated
+        ]
+        if not configs:
+            log.debug(
+                "TDM: no configs survived filtering; leaving operands unspecialized"
+            )
+            return
+
+        # Exactly one production commit point, covering addmm too: its heuristic
+        # inherits this method and AddMMConfigMixin only extends get_extra_kwargs.
+        commit_tdm_operand_layout(mat1, mat2)
+        log.debug("TDM: committed operand layout for %d configs", len(configs))
+        yield from configs
 
 
 @register_template_heuristic(

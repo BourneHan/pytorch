@@ -467,7 +467,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
                 # empty the TDM config pool, and displacing the ordinary
                 # candidate would then leave autotuning worse off than with TDM
                 # switched off entirely.
-                if use_triton_tdm_template(mat1, mat2, add_guards=True):
+                if use_triton_tdm_template(mat1, mat2):
                     templates_to_use.append(persistent_tdm_mm_template)
                 if use_triton_tma_template(
                     mat1, mat2, output_layout=layout, add_guards=True
@@ -751,7 +751,7 @@ def tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
         else:
             # See tuned_mm: TDM is additive, it does not displace the ordinary
             # persistent candidate.
-            if use_triton_tdm_template(mat1, mat2, add_guards=True):
+            if use_triton_tdm_template(mat1, mat2):
                 templates_to_use.append(persistent_tdm_mm_template)
             if use_triton_tma_template(
                 mat1, mat2, output_layout=layout, add_guards=True
@@ -968,7 +968,7 @@ def get_scaling_options(
 
 def _use_scaled_descriptor_template(mat_a, mat_b, layout) -> bool:
     if torch.version.hip is not None:
-        return use_triton_tdm_scaled_template(mat_a, mat_b, add_guards=True)
+        return use_triton_tdm_scaled_template(mat_a, mat_b)
     return use_triton_tma_template(mat_a, mat_b, output_layout=layout, add_guards=True)
 
 

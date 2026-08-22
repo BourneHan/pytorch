@@ -736,6 +736,65 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
             },
         )
 
+    def test_flex_head_dim_32_is_legal_but_rejected_by_policy(self):
+        """FP16 head_dim=32 is a 64-byte request: legal, and rejected anyway.
+
+        The authoritative TDM material names this exact case as a correct shape
+        that a framework-level 128-byte gate turns away. The rejection reason is
+        asserted, not just the boolean, so that the 128-byte policy can never be
+        quietly restated as a descriptor legality rule.
+        """
+        from torch._inductor.utils import (
+            _TDM_MIN_INNERMOST_REQUEST_BYTES,
+            use_flex_tdm_descriptor,
+        )
+        from torch._inductor.virtualized import V
+
+        class FakeSizeVars:
+            @staticmethod
+            def statically_known_equals(expr, val):
+                return expr == val
+
+            @staticmethod
+            def statically_known_multiple_of(expr, val):
+                return expr % val == 0
+
+            @staticmethod
+            def statically_known_geq(expr, val):
+                return expr >= val
+
+        # Row stride padded to 64 elements (128 bytes) so every outer stride
+        # satisfies policy and the block width is the only thing left to fail.
+        def make_qkv(name):
+            mat = mock.Mock()
+            mat.get_device.return_value = torch.device("cuda")
+            mat.get_dtype.return_value = torch.float16
+            mat.get_size.return_value = (2, 4, 128, 32)
+            mat.get_stride.return_value = (32768, 8192, 64, 1)
+            mat.get_name.return_value = name
+            mat.get_layout.return_value = mock.Mock(offset=0)
+            return mat
+
+        qkv = [make_qkv(n) for n in ("q", "k", "v")]
+        head_dim_bytes = 32 * torch.float16.itemsize
+        self.assertEqual(head_dim_bytes, 64)
+        # Legal: it clears the one alignment-shaped rule Triton enforces.
+        self.assertGreaterEqual(head_dim_bytes, _TDM_MIN_INNERMOST_REQUEST_BYTES)
+
+        graph = mock.Mock(sizevars=FakeSizeVars(), unaligned_buffers=set())
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+            self.assertLogs("torch._inductor.utils", level="DEBUG") as logs,
+        ):
+            self.assertFalse(
+                use_flex_tdm_descriptor(*qkv, block_shapes=[(128, 32)] * 3)
+            )
+
+        reasons = "\n".join(logs.output)
+        self.assertIn("block width is not 128-byte aligned", reasons)
+        self.assertNotIn("innermost request extent", reasons)
+
     def test_flex_templates_gate_descriptors_on_tma_or_tdm(self):
         from torch._inductor.kernel.flex.common import load_flex_template
 

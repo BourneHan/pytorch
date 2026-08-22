@@ -2305,7 +2305,7 @@ class TestTDMScaled(TestCase):
             self.assertTrue(
                 mm_kernel._use_scaled_descriptor_template(mat_a, mat_b, layout)
             )
-            tdm_gate.assert_called_once_with(mat_a, mat_b, add_guards=True)
+            tdm_gate.assert_called_once_with(mat_a, mat_b)
 
     def test_scaled_descriptor_not_selected_on_hip(self):
         # Same routing as above, but through the real gate: no scaled operand

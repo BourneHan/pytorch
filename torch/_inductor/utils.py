@@ -188,7 +188,7 @@ _TDM_OPERAND_ALIGNMENT_BYTES = TMA_ALIGNMENT
 # the check is relative (outer stride and block width), so it never proves that
 # a tile begins at a 128-byte absolute address, and it turns away shapes that
 # would have worked -- FP16 with head_dim 32 is 64 bytes and is rejected here.
-_TDM_DIRECT_PATH_ALIGNMENT_BYTES = 128
+_TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES = 128
 _TDM_SUPPORTED_DTYPES: OrderedSet[torch.dtype] = OrderedSet(
     [torch.float16, torch.bfloat16, torch.float32]
 )
@@ -2229,12 +2229,17 @@ def _tdm_operand_compatible(
     # the logical tensor extent here.
     if not aligned(offset * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
+    # Implied by the 128-byte check below and kept anyway: that check is a
+    # provisional performance policy that is expected to be relaxed, and the
+    # 16-byte descriptor contract must not disappear with it.
     if not aligned(strides_i[outer_idx] * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
 
     # Inductor selection policy: relative 128-byte row alignment. See the note
-    # on _TDM_DIRECT_PATH_ALIGNMENT_BYTES -- this does not prove direct-path use.
-    return aligned(strides_i[outer_idx] * itemsize, _TDM_DIRECT_PATH_ALIGNMENT_BYTES)
+    # on _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES -- this does not prove direct-path use.
+    return aligned(
+        strides_i[outer_idx] * itemsize, _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES
+    )
 
 
 def _guard_tdm_operand_layout(mat: IRNode) -> None:
@@ -2246,27 +2251,49 @@ def _guard_tdm_operand_layout(mat: IRNode) -> None:
     V.graph.sizevars.guard_int(mat.get_layout().offset)
 
 
+class TDMGuardMode(enum.Enum):
+    """How much a TDM operand check is allowed to constrain the graph.
+
+    Admission and commitment are separate phases because they happen at
+    different times: a template is admitted while lowering, but its
+    configuration pool is not known until the heuristic has finished filtering
+    and scaling. Committing exact layout at admission specializes the graph for
+    a template that may end up contributing nothing.
+    """
+
+    # Decide only; prove any symbolic premise statically or reject.
+    NONE = "none"
+    # Admission. May bound a dynamic descriptor dimension to int32, which does
+    # not pin its value, but must not call guard_int.
+    BOUNDS = "bounds"
+    # Commitment. Pins size, stride and storage offset. Only legitimate once a
+    # non-empty configuration set has materialized.
+    EXACT = "exact"
+
+
 def _tdm_operands_compatible(
     matrices: Sequence[IRNode],
     accepted_dtypes: OrderedSet[torch.dtype],
-    add_guards: bool,
+    guard_mode: TDMGuardMode,
 ) -> bool:
-    """Admit a full operand list for TDM, specializing only once it is admitted.
+    """Check a full operand list for TDM under the given guard mode.
 
     Rejecting an operand must not leave the graph specialized on its shape, so
-    the decision is made guard-free before any ``guard_int`` pins a hint.
+    the decision is made guard-free before anything pins a hint.
     """
     if not all(_tdm_operand_compatible(mat, accepted_dtypes) for mat in matrices):
         return False
 
     # Bounds only; unlike specialization, this does not pin a dynamic dim.
     if not all(
-        _descriptor_shape_fits_in_int32(mat.get_size(), add_guards=add_guards)
+        _descriptor_shape_fits_in_int32(
+            mat.get_size(), add_guards=guard_mode is not TDMGuardMode.NONE
+        )
         for mat in matrices
     ):
         return False
 
-    if not add_guards:
+    if guard_mode is not TDMGuardMode.EXACT:
         return True
 
     for mat in matrices:
@@ -2274,24 +2301,44 @@ def _tdm_operands_compatible(
     return True
 
 
-def use_triton_tdm_template(
-    *matrices: IRNode,
-    add_guards: bool = False,
-) -> bool:
-    """Return whether dense MM operands may use the gfx1250 TDM template."""
+def use_triton_tdm_template(*matrices: IRNode) -> bool:
+    """Return whether dense MM operands may be admitted to the TDM template.
+
+    Admission only. It may bound a dynamic dimension to int32 but never pins a
+    size, stride or offset -- the operands are not specialized until
+    ``commit_tdm_operand_layout`` runs against a materialized config set.
+    """
     if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
         return False
-    return _tdm_operands_compatible(matrices, _TDM_SUPPORTED_DTYPES, add_guards)
+    return _tdm_operands_compatible(
+        matrices, _TDM_SUPPORTED_DTYPES, TDMGuardMode.BOUNDS
+    )
+
+
+def commit_tdm_operand_layout(*matrices: IRNode) -> None:
+    """Specialize operands whose TDM configurations have actually materialized.
+
+    The only production caller of ``TDMGuardMode.EXACT``. Revalidates rather
+    than trusting admission, and raises rather than falling back: reaching here
+    means a TDM choice is being built, so a failed premise is a bug in the
+    admission/commit split and not an ordinary "no candidates" outcome.
+    """
+    if not _tdm_operands_compatible(
+        matrices, _TDM_SUPPORTED_DTYPES, TDMGuardMode.EXACT
+    ):
+        raise AssertionError("TDM layout commit revalidation failed")
 
 
 def _tdm_scaled_operands_supported(
     *matrices: IRNode,
-    add_guards: bool = False,
+    guard_mode: TDMGuardMode = TDMGuardMode.NONE,
 ) -> bool:
     """Whether scaled FP8 MM operands satisfy the gfx1250 TDM descriptor rules."""
     if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
         return False
-    return _tdm_operands_compatible(matrices, _TDM_SCALED_SUPPORTED_DTYPES, add_guards)
+    return _tdm_operands_compatible(
+        matrices, _TDM_SCALED_SUPPORTED_DTYPES, guard_mode
+    )
 
 
 # The persistent scaled template derives its tile count from `program_id` and
@@ -2306,10 +2353,7 @@ def _tdm_scaled_operands_supported(
 _TDM_SCALED_TEMPLATE_BLOCKED: bool = True
 
 
-def use_triton_tdm_scaled_template(
-    *matrices: IRNode,
-    add_guards: bool = False,
-) -> bool:
+def use_triton_tdm_scaled_template(*matrices: IRNode) -> bool:
     """Return whether scaled FP8 MM operands may use gfx1250 TDM descriptors.
 
     Always False while ``_TDM_SCALED_TEMPLATE_BLOCKED`` is set; see the note
@@ -2318,7 +2362,7 @@ def use_triton_tdm_scaled_template(
     """
     if _TDM_SCALED_TEMPLATE_BLOCKED:
         return False
-    return _tdm_scaled_operands_supported(*matrices, add_guards=add_guards)
+    return _tdm_scaled_operands_supported(*matrices, guard_mode=TDMGuardMode.BOUNDS)
 
 
 def use_gfx1250_descriptor_codegen(device: torch.device | None) -> bool:
@@ -2403,15 +2447,15 @@ def use_flex_tdm_descriptor(
             )
 
         # Inductor selection policy: relative 128-byte alignment only. See the
-        # note on _TDM_DIRECT_PATH_ALIGNMENT_BYTES.
+        # note on _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES.
         if not all(
-            aligned(s * itemsize, _TDM_DIRECT_PATH_ALIGNMENT_BYTES)
+            aligned(s * itemsize, _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES)
             for s in strides[:-1]
         ):
             return reject("outer strides are not 128-byte aligned")
         if block_shape and not aligned(
             block_shape[-1] * itemsize,
-            _TDM_DIRECT_PATH_ALIGNMENT_BYTES,
+            _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES,
         ):
             return reject("block width is not 128-byte aligned")
 

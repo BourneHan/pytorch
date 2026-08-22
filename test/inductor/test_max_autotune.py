@@ -1,4 +1,5 @@
 # Owner(s): ["module: inductor"]
+import ast
 import contextlib
 import functools
 import inspect
@@ -5897,9 +5898,11 @@ class TestTDMConfigDenseAndGeneric(TestCase):
                         stride=(aligned_dim, 1),
                     ),
                     make_mat("B"),
-                    add_guards=True,
                 )
             )
+            # Admission may bound a dynamic dim, but must not pin it: the
+            # phase separation is asserted in
+            # test_tdm_admission_bounds_do_not_specialize.
             self.assertGreater(len(graph.sizevars.shape_env.guards), guards_before)
             self.assertFalse(
                 use_triton_tdm_template(
@@ -5909,7 +5912,6 @@ class TestTDMConfigDenseAndGeneric(TestCase):
                         stride=(unaligned_dim, 1),
                     ),
                     make_mat("B"),
-                    add_guards=True,
                 )
             )
 
@@ -5965,14 +5967,14 @@ class TestTDMConfigDenseAndGeneric(TestCase):
 
             guards_before = len(graph.sizevars.shape_env.guards)
             self.assertFalse(
-                use_triton_tdm_template(accepted, rejected, add_guards=True)
+                use_triton_tdm_template(accepted, rejected)
             )
             self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before)
 
             # The reverse order must hold too: rejecting the first operand
             # cannot specialize it either.
             self.assertFalse(
-                use_triton_tdm_template(rejected, accepted, add_guards=True)
+                use_triton_tdm_template(rejected, accepted)
             )
             self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before)
 
@@ -6022,6 +6024,172 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             ],
             [(64, 64, 64)],
         )
+
+    @staticmethod
+    def _exact_layout_guards(shape_env, symbols):
+        """Guards that pin a symbol's value, excluding broad range bounds.
+
+        Calibrated by the caller before it is trusted -- a classifier that
+        silently counted nothing would make every phase assertion below vacuous.
+        """
+        return sum(
+            isinstance(guard[0], sympy.Equality)
+            and bool(guard[0].free_symbols & symbols)
+            for guard in shape_env.guards
+        )
+
+    def test_tdm_admission_bounds_do_not_specialize(self):
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.utils import (
+            commit_tdm_operand_layout,
+            use_triton_tdm_template,
+        )
+        from torch.fx.experimental.symbolic_shapes import DimDynamic
+
+        graph = GraphLowering(make_fx(lambda: torch.zeros(2, 3))())
+        shape_env = graph.sizevars.shape_env
+
+        def make_dim(name, hint):
+            return shape_env.create_symbol(
+                hint, source=ConstantSource(name), dynamic_dim=DimDynamic.DYNAMIC
+            )
+
+        def make_mat(name, dim):
+            return Buffer(
+                name=name,
+                layout=FixedLayout(
+                    torch.device("cuda"), torch.float16, (128, dim), (dim, 1), 0
+                ),
+            )
+
+        # Calibrate the classifier: a range bound must not read as exact, and a
+        # pinned value must.
+        cal_bound, cal_pin = make_dim("cal_bound", 128), make_dim("cal_pin", 128)
+        with V.set_graph_handler(graph):
+            graph.sizevars.guard_or_false(
+                sympy.Le(cal_bound, torch.iinfo(torch.int32).max)
+            )
+            self.assertEqual(self._exact_layout_guards(shape_env, {cal_bound}), 0)
+            graph.sizevars.guard_int(cal_pin)
+            self.assertEqual(self._exact_layout_guards(shape_env, {cal_pin}), 1)
+
+        dim = make_dim("admitted_dim", 128)
+        symbols = {dim}
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+        ):
+            self.assertTrue(
+                use_triton_tdm_template(make_mat("a", dim), make_mat("b", dim))
+            )
+            self.assertEqual(self._exact_layout_guards(shape_env, symbols), 0)
+
+            # Only the commit phase may specialize.
+            commit_tdm_operand_layout(make_mat("a", dim), make_mat("b", dim))
+            self.assertGreater(self._exact_layout_guards(shape_env, symbols), 0)
+
+    def _drive_tdm_heuristic(self, generated, commit=None):
+        """Run the real TDM heuristic generator over a fixed config list."""
+        from torch._inductor.heuristics.template import triton as tdm_heuristics
+        from torch._inductor.heuristics.template.triton import (
+            MMTemplateConfigMixin,
+            ROCmPersistentTDMTemplateConfigHeuristic,
+        )
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        mat1, mat2 = mock.Mock(), mock.Mock()
+        kernel_inputs = MMKernelInputs([mat1, mat2], mat1_idx=0, mat2_idx=1)
+        patched_commit = (
+            mock.patch.object(tdm_heuristics, "commit_tdm_operand_layout", commit)
+            if commit is not None
+            else mock.patch.object(tdm_heuristics, "commit_tdm_operand_layout")
+        )
+        with (
+            mock.patch.object(
+                tdm_heuristics, "tdm_descriptor_row_major", side_effect=[True, True]
+            ),
+            mock.patch.object(tdm_heuristics, "get_num_sms", return_value=1),
+            mock.patch.object(
+                MMTemplateConfigMixin,
+                "_get_template_configs_impl",
+                return_value=iter(generated),
+            ),
+            patched_commit as commit_mock,
+        ):
+            heuristic = ROCmPersistentTDMTemplateConfigHeuristic()
+            configs = list(heuristic._get_template_configs_impl(kernel_inputs, "mm"))
+        return configs, commit_mock, (mat1, mat2)
+
+    def test_tdm_empty_config_set_does_not_commit(self):
+        # The defect this ordering exists to prevent: every config removed by
+        # filtering or shape-hint scaling, yet the graph left specialized.
+        configs, commit, _ = self._drive_tdm_heuristic([])
+        self.assertEqual(configs, [])
+        commit.assert_not_called()
+
+    def test_tdm_nonempty_config_set_commits_once(self):
+        configs, commit, operands = self._drive_tdm_heuristic(
+            [{"BLOCK_M": 64}, {"BLOCK_M": 128}]
+        )
+        self.assertEqual(len(configs), 2)
+        self.assertTrue(all(c["TMA_EXPERIMENTAL_API"] is False for c in configs))
+        commit.assert_called_once_with(*operands)
+
+    def test_tdm_commit_failure_is_not_swallowed(self):
+        # A failed commit means admission and commitment disagree. That is a
+        # bug, not an ordinary "no candidates" outcome, so it must propagate.
+        with self.assertRaises(AssertionError):
+            self._drive_tdm_heuristic(
+                [{"BLOCK_M": 64}],
+                commit=mock.Mock(side_effect=AssertionError("revalidation failed")),
+            )
+
+    def test_tdm_commit_revalidates_rather_than_trusting_admission(self):
+        from torch._inductor.utils import commit_tdm_operand_layout
+
+        graph = GraphLowering(make_fx(lambda: torch.zeros(2, 3))())
+        unaligned = Buffer(
+            name="unaligned",
+            layout=FixedLayout(
+                torch.device("cuda"), torch.float16, (128, 65), (65, 1), 0
+            ),
+        )
+        with (
+            V.set_graph_handler(graph),
+            mock.patch("torch._inductor.utils._gfx1250_tdm_enabled", return_value=True),
+        ):
+            with self.assertRaisesRegex(AssertionError, "commit revalidation failed"):
+                commit_tdm_operand_layout(unaligned, unaligned)
+
+    def test_tdm_exact_commit_has_a_single_production_call_site(self):
+        # No rollback exists, so a second commit point or a swallowed failure
+        # would silently widen specialization. Enforce that mechanically.
+        import torch._inductor.heuristics.template.triton as tdm_heuristics
+        import torch._inductor.kernel.mm as mm_kernel
+        import torch._inductor.utils as inductor_utils
+
+        sources = {
+            m.__file__: open(m.__file__).read()
+            for m in (inductor_utils, tdm_heuristics, mm_kernel)
+        }
+        call_sites = [
+            (path, node.lineno)
+            for path, text in sources.items()
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "commit_tdm_operand_layout"
+        ]
+        self.assertEqual(len(call_sites), 1, call_sites)
+
+        exact_users = [
+            path
+            for path, text in sources.items()
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Attribute)
+            and node.attr == "EXACT"
+            and getattr(node.value, "id", None) == "TDMGuardMode"
+        ]
+        self.assertEqual(exact_users, [inductor_utils.__file__])
 
     def test_tdm_config_filtering_requires_injected_orientation(self):
         # Defaulting the orientation would silently filter tiles against the
