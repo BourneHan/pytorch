@@ -36,6 +36,7 @@ from ...kernel_inputs import KernelInputs, MMKernelInputs
 from ...runtime.hints import DeviceProperties
 from ...utils import (
     _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES,
+    _TDM_MIN_INNERMOST_REQUEST_BYTES,
     commit_tdm_operand_layout,
     get_backend_num_stages,
     get_default_kpack,
@@ -99,13 +100,30 @@ def _tdm_descriptor_orientation(kwargs: dict[str, Any]) -> tuple[bool, bool]:
     return kwargs["tdm_a_row_major"], kwargs["tdm_b_row_major"]
 
 
+def _tdm_block_legal(block: int, dtype_size: int) -> bool:
+    """Triton's enforced rule: the innermost request must hold >= 16 bytes.
+
+    Kept independent of the 128-byte policy below. The policy currently implies
+    this threshold, but it is explicitly provisional -- relaxing it must not
+    silently drop the one descriptor rule the frontend actually checks.
+    """
+    return int(block) * dtype_size >= _TDM_MIN_INNERMOST_REQUEST_BYTES
+
+
+def _tdm_block_direct_path(block: int, dtype_size: int) -> bool:
+    """Inductor performance policy: relative 128-byte contiguous block width."""
+    return (int(block) * dtype_size) % _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES == 0
+
+
 def _tdm_block_aligned(block: int, dtype_size: int) -> bool:
-    """Whether a tile's contiguous extent satisfies direct-path policy."""
+    """Whether a tile's contiguous extent is both legal and selected."""
     if dtype_size <= 0:
         raise AssertionError(
             f"TDM config filtering requires a positive dtype_size, got {dtype_size}"
         )
-    return (int(block) * dtype_size) % _TDM_DIRECT_PATH_RELATIVE_POLICY_BYTES == 0
+    return _tdm_block_legal(block, dtype_size) and _tdm_block_direct_path(
+        block, dtype_size
+    )
 
 
 def _tdm_descriptor_blocks_aligned(
@@ -1938,14 +1956,17 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         the graph looks as though TDM had never been admitted at all.
         """
         surviving = 0
-        for config in configs:
+        for triton_config in configs:
             surviving += 1
-            yield config
+            yield triton_config
         if not surviving:
+            # Deliberately neutral: descriptor alignment is the usual cause,
+            # but caller exclusions and the other preprocessing stages can also
+            # empty the pool, and this warning cannot tell them apart.
             log.warning(
-                "TDM: descriptor block alignment left no usable configs out of "
-                "%d candidates (dtype_size=%d, a_row_major=%s, b_row_major=%s); "
-                "this template contributes no autotuning choices",
+                "TDM: preprocessing left no usable configs out of %d candidates "
+                "(dtype_size=%d, a_row_major=%s, b_row_major=%s); this template "
+                "contributes no autotuning choices",
                 candidate_count,
                 dtype_size,
                 a_row_major,

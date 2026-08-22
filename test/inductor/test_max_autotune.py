@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
@@ -5966,16 +5967,12 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             )
 
             guards_before = len(graph.sizevars.shape_env.guards)
-            self.assertFalse(
-                use_triton_tdm_template(accepted, rejected)
-            )
+            self.assertFalse(use_triton_tdm_template(accepted, rejected))
             self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before)
 
             # The reverse order must hold too: rejecting the first operand
             # cannot specialize it either.
-            self.assertFalse(
-                use_triton_tdm_template(rejected, accepted)
-            )
+            self.assertFalse(use_triton_tdm_template(rejected, accepted))
             self.assertEqual(len(graph.sizevars.shape_env.guards), guards_before)
 
     def test_tdm_descriptor_orientation_uses_unit_stride_dimension(self):
@@ -6038,6 +6035,27 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             for guard in shape_env.guards
         )
 
+    def test_tdm_dense_block_legality_is_separate_from_128_byte_policy(self):
+        # Dense counterpart to test_flex_head_dim_32_is_legal_but_rejected_by
+        # _policy. A 64-byte BF16 block is descriptor-legal and rejected by
+        # policy alone, so relaxing the provisional 128-byte policy must not
+        # take the >=16-byte frontend rule with it.
+        from torch._inductor.heuristics.template.triton import (
+            _tdm_block_direct_path,
+            _tdm_block_legal,
+        )
+
+        itemsize = torch.bfloat16.itemsize
+        self.assertEqual(32 * itemsize, 64)
+        self.assertTrue(_tdm_block_legal(32, itemsize))
+        self.assertFalse(_tdm_block_direct_path(32, itemsize))
+
+        # Below the frontend threshold: illegal regardless of policy.
+        self.assertFalse(_tdm_block_legal(4, itemsize))
+        # At 128 bytes: legal and selected.
+        self.assertTrue(_tdm_block_legal(64, itemsize))
+        self.assertTrue(_tdm_block_direct_path(64, itemsize))
+
     def test_tdm_admission_bounds_do_not_specialize(self):
         from torch._dynamo.source import ConstantSource
         from torch._inductor.utils import (
@@ -6089,7 +6107,18 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             self.assertGreater(self._exact_layout_guards(shape_env, symbols), 0)
 
     def _drive_tdm_heuristic(self, generated, commit=None):
-        """Run the real TDM heuristic generator over a fixed config list."""
+        """Drive the TDM wrapper over an injected config list.
+
+        Scope: this exercises the real
+        ``ROCmPersistentTDMTemplateConfigHeuristic._get_template_configs_impl``
+        but *replaces* ``MMTemplateConfigMixin._get_template_configs_impl``, so
+        block filtering, ``_scale_mm_configs``, the post-scaling
+        ``tdm_exclude`` re-check, Origami and ``_report_empty_tdm_pool`` do not
+        run. It proves the commit ordering of the wrapper, not that production
+        preprocessing produces the empty or nonempty pool in the first place.
+        An integration test that starts from real configs and is emptied by
+        post-scaling ``tdm_exclude`` still needs a built environment.
+        """
         from torch._inductor.heuristics.template import triton as tdm_heuristics
         from torch._inductor.heuristics.template.triton import (
             MMTemplateConfigMixin,
@@ -6121,8 +6150,9 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         return configs, commit_mock, (mat1, mat2)
 
     def test_tdm_empty_config_set_does_not_commit(self):
-        # The defect this ordering exists to prevent: every config removed by
-        # filtering or shape-hint scaling, yet the graph left specialized.
+        # Wrapper-level: see _drive_tdm_heuristic for what is mocked. The
+        # defect this ordering exists to prevent is every config being removed
+        # by filtering or shape-hint scaling with the graph left specialized.
         configs, commit, _ = self._drive_tdm_heuristic([])
         self.assertEqual(configs, [])
         commit.assert_not_called()
@@ -6145,6 +6175,10 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             )
 
     def test_tdm_commit_revalidates_rather_than_trusting_admission(self):
+        # Helper-level only: the operand is invalid on entry, so this shows the
+        # helper refuses to specialize it. It does not demonstrate the full
+        # admit-then-invalidate-then-commit sequence, which needs the real
+        # preprocessing pipeline and therefore a built environment.
         from torch._inductor.utils import commit_tdm_operand_layout
 
         graph = GraphLowering(make_fx(lambda: torch.zeros(2, 3))())
@@ -6168,28 +6202,53 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         import torch._inductor.kernel.mm as mm_kernel
         import torch._inductor.utils as inductor_utils
 
-        sources = {
-            m.__file__: open(m.__file__).read()
-            for m in (inductor_utils, tdm_heuristics, mm_kernel)
+        modules = (inductor_utils, tdm_heuristics, mm_kernel)
+        trees = {
+            m.__file__: ast.parse(Path(m.__file__).read_text(encoding="utf-8"))
+            for m in modules
         }
+
         call_sites = [
             (path, node.lineno)
-            for path, text in sources.items()
-            for node in ast.walk(ast.parse(text))
+            for path, tree in trees.items()
+            for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and getattr(node.func, "id", None) == "commit_tdm_operand_layout"
         ]
         self.assertEqual(len(call_sites), 1, call_sites)
 
-        exact_users = [
-            path
-            for path, text in sources.items()
-            for node in ast.walk(ast.parse(text))
+        # EXACT is referenced more than once inside utils (the mode comparison
+        # and the argument), so assert on the owning modules, not a count.
+        exact_refs = [
+            (path, node.lineno)
+            for path, tree in trees.items()
+            for node in ast.walk(tree)
             if isinstance(node, ast.Attribute)
             and node.attr == "EXACT"
             and getattr(node.value, "id", None) == "TDMGuardMode"
         ]
-        self.assertEqual(exact_users, [inductor_utils.__file__])
+        # Guard against a silently-vacuous extractor: if this found nothing,
+        # every assertion below would pass for the wrong reason.
+        self.assertGreater(len(exact_refs), 0)
+        self.assertEqual({path for path, _ in exact_refs}, {inductor_utils.__file__})
+
+        # The only place that *passes* EXACT to the compatibility helper is the
+        # commit API itself.
+        passers = [
+            fn.name
+            for fn in ast.walk(trees[inductor_utils.__file__])
+            if isinstance(fn, ast.FunctionDef)
+            for call in ast.walk(fn)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", None) == "_tdm_operands_compatible"
+            and any(
+                isinstance(a, ast.Attribute)
+                and a.attr == "EXACT"
+                and getattr(a.value, "id", None) == "TDMGuardMode"
+                for a in call.args
+            )
+        ]
+        self.assertEqual(passers, ["commit_tdm_operand_layout"])
 
     def test_tdm_config_filtering_requires_injected_orientation(self):
         # Defaulting the orientation would silently filter tiles against the

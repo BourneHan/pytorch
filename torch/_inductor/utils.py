@@ -2229,9 +2229,10 @@ def _tdm_operand_compatible(
     # the logical tensor extent here.
     if not aligned(offset * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
-    # Implied by the 128-byte check below and kept anyway: that check is a
-    # provisional performance policy that is expected to be relaxed, and the
-    # 16-byte descriptor contract must not disappear with it.
+    # Redundant under the 128-byte policy below and kept deliberately: that
+    # policy is provisional, while this is an independent Inductor policy on
+    # outer strides. It is not the innermost-block contract -- that is a
+    # >=16-byte threshold on the request extent, checked by the config filter.
     if not aligned(strides_i[outer_idx] * itemsize, _TDM_OPERAND_ALIGNMENT_BYTES):
         return False
 
@@ -2336,9 +2337,7 @@ def _tdm_scaled_operands_supported(
     """Whether scaled FP8 MM operands satisfy the gfx1250 TDM descriptor rules."""
     if not matrices or not _gfx1250_tdm_enabled(matrices[0].get_device()):
         return False
-    return _tdm_operands_compatible(
-        matrices, _TDM_SCALED_SUPPORTED_DTYPES, guard_mode
-    )
+    return _tdm_operands_compatible(matrices, _TDM_SCALED_SUPPORTED_DTYPES, guard_mode)
 
 
 # The persistent scaled template derives its tile count from `program_id` and
