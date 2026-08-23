@@ -45,6 +45,7 @@ from torch.testing._internal.common_utils import (
     IS_CPU_EXT_SVE_SUPPORTED,
     IS_FBCODE,
     IS_MACOS,
+    IS_WINDOWS,
     MI200_ARCH,
     parametrize,
     requires_mkl,
@@ -1363,6 +1364,35 @@ class CPUReproTests(TestCase):
             FileCheck().check("(2, 3, 4, 4), (128, 1, 32, 8)").check(
                 "empty_strided_cpu((4, 3, 3, 3), (27, 1, 9, 3)"
             ).run(code)
+
+    @parametrize("m", (0, 1, 2))
+    @config.patch(freezing=True)
+    @unittest.skipIf(IS_WINDOWS, "_int_mm is unavailable on Windows")
+    @torch.no_grad()
+    def test_int_mm_dynamic_output_stride_with_frozen_weight(self, m):
+        in_features = 32
+        out_features = 64
+
+        class Mod(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.randint(
+                    -32, 31, (in_features, out_features), dtype=torch.int8
+                )
+
+            def forward(self, x):
+                return torch._int_mm(x, self.w).float()
+
+        torch._dynamo.reset()
+        mod = Mod().eval()
+        x = torch.randint(-32, 31, (m, in_features), dtype=torch.int8)
+
+        expected = mod(x)
+        actual = torch.compile(mod, dynamic=True, fullgraph=True)(x)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.shape, (m, out_features))
+        self.assertEqual(actual.stride(), expected.stride())
 
     @config.patch(implicit_fallbacks=True)
     def test_repeat_interleave(self):

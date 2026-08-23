@@ -519,9 +519,32 @@ def significant_strides_equal(
     return True
 
 
+def _match_insignificant_strides(
+    layout: Layout,
+    strides: Sequence[_IntLike],
+) -> list[Expr]:
+    """
+    Keep the layout's significant strides and copy requested insignificant
+    strides when doing so cannot introduce a symbol unavailable to codegen.
+
+    Callers must first establish that the significant strides are equivalent.
+    """
+    available_symbols = free_symbols([*layout.size, *layout.stride, layout.offset])
+    new_stride = [*layout.stride]
+    is_empty = any(
+        V.graph.sizevars.statically_known_equals(dim, 0) for dim in layout.size
+    )
+    for i, size in enumerate(layout.size):
+        if is_empty or V.graph.sizevars.statically_known_leq(size, 1):
+            requested_symbols = free_symbols([strides[i]])
+            if requested_symbols.issubset(available_symbols):
+                new_stride[i] = strides[i]
+    return new_stride
+
+
 def try_match_insignificant_strides(
     tensor: IRNode,
-    strides: Sequence[int | torch.SymInt],
+    strides: Sequence[_IntLike],
 ) -> IRNode:
     """
     Tries to match the strides of the tensor to those in the meta_strides. Strides of insignificant
@@ -542,11 +565,7 @@ def try_match_insignificant_strides(
         return tensor
 
     storage, old_layout = as_storage_and_layout(tensor)
-    new_stride = [*old_layout.stride]
-    is_empty = tensor.is_zero_elements()
-    for i, s in enumerate(tensor.get_size()):
-        if is_empty or V.graph.sizevars.statically_known_leq(s, 1):
-            new_stride[i] = strides[i]
+    new_stride = _match_insignificant_strides(old_layout, strides)
 
     new_layout = FixedLayout(
         old_layout.device,
@@ -5007,7 +5026,10 @@ class FlexibleLayout(Layout):
     def as_exact_strides(
         self, exact_strides: Sequence[_IntLike], allow_padding: bool = False
     ) -> FixedLayout:
-        new_stride = exact_strides
+        if significant_strides_equal(exact_strides, self.stride, self.size):
+            new_stride = _match_insignificant_strides(self, exact_strides)
+        else:
+            new_stride = exact_strides
         if self.should_pad_strides() and allow_padding:
             new_stride = self._pad_strides(new_stride, self.size, self.dtype)
 
