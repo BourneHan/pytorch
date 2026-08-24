@@ -6053,9 +6053,7 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         for label, pool in pools.items():
             for dtype_size in (0, -2):
                 with self.subTest(pool=label, dtype_size=dtype_size):
-                    with self.assertRaisesRegex(
-                        AssertionError, "positive dtype_size"
-                    ):
+                    with self.assertRaisesRegex(AssertionError, "positive dtype_size"):
                         heuristic.preprocess_mm_configs(
                             128,
                             128,
