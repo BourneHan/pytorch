@@ -184,7 +184,7 @@ _TDM_OPERAND_ALIGNMENT_BYTES = TMA_ALIGNMENT
 
 # Inductor *performance* policy, not correctness. A descriptor that is 16-byte
 # but not 128-byte aligned still compiles and still produces correct results; it
-# only forgoes the direct L2->LDS path. Two consequences worth keeping in view:
+# only forgoes the direct request path. Two consequences worth keeping in view:
 # the check is relative (outer stride and block width), so it never proves that
 # a tile begins at a 128-byte absolute address, and it turns away shapes that
 # would have worked -- FP16 with head_dim 32 is 64 bytes and is rejected here.
