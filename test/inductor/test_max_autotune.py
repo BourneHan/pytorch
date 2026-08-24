@@ -6035,6 +6035,43 @@ class TestTDMConfigDenseAndGeneric(TestCase):
             for guard in shape_env.guards
         )
 
+    def test_tdm_config_filtering_rejects_invalid_dtype_size(self):
+        # The empty-pool cases are the point: validation used to live inside the
+        # per-config predicate, so a pool that started empty skipped it and
+        # reported success for metadata that cannot be used.
+        from torch._inductor.heuristics.template.triton import (
+            _tdm_block_aligned,
+            ROCmPersistentTDMTemplateConfigHeuristic,
+        )
+
+        heuristic = ROCmPersistentTDMTemplateConfigHeuristic()
+        pools = {
+            "empty": [],
+            "nonempty": heuristic.persistent_mm_configs,
+        }
+        self.assertTrue(pools["nonempty"])
+        for label, pool in pools.items():
+            for dtype_size in (0, -2):
+                with self.subTest(pool=label, dtype_size=dtype_size):
+                    with self.assertRaisesRegex(
+                        AssertionError, "positive dtype_size"
+                    ):
+                        heuristic.preprocess_mm_configs(
+                            128,
+                            128,
+                            128,
+                            pool,
+                            dtype_size=dtype_size,
+                            op_name="mm",
+                            tdm_a_row_major=True,
+                            tdm_b_row_major=True,
+                        )
+
+        # Positive control on the real itemsize path, not a magic integer.
+        for dtype in (torch.float16, torch.bfloat16):
+            self.assertGreater(dtype.itemsize, 0)
+            self.assertTrue(_tdm_block_aligned(64, dtype.itemsize))
+
     def test_tdm_dense_block_legality_is_separate_from_128_byte_policy(self):
         # Dense counterpart to test_flex_head_dim_32_is_legal_but_rejected_by
         # _policy. A 64-byte BF16 block is descriptor-legal and rejected by

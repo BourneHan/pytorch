@@ -1960,10 +1960,13 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             surviving += 1
             yield triton_config
         if not surviving:
-            # Deliberately neutral: descriptor alignment is the usual cause,
-            # but caller exclusions and the other preprocessing stages can also
-            # empty the pool, and this warning cannot tell them apart.
-            log.warning(
+            # debug, not warning: an empty pool is an expected outcome for any
+            # shape whose clamped block width misses the 128-byte policy -- a
+            # small-K BF16 GEMM hits it every compile -- so warning here would
+            # be noise. Deliberately neutral about the cause too: descriptor
+            # alignment is the usual one, but caller exclusions and the other
+            # preprocessing stages can also empty the pool.
+            log.debug(
                 "TDM: preprocessing left no usable configs out of %d candidates "
                 "(dtype_size=%d, a_row_major=%s, b_row_major=%s); this template "
                 "contributes no autotuning choices",
