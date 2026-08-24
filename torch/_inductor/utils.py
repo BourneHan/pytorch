@@ -194,6 +194,8 @@ _TDM_SUPPORTED_DTYPES: OrderedSet[torch.dtype] = OrderedSet(
 )
 _TDM_SCALED_SUPPORTED_DTYPES: OrderedSet[torch.dtype] = OrderedSet(
     [torch.float8_e4m3fn, torch.float8_e5m2]
+)
+
 TRITON_FLOAT8_DTYPES = (
     torch.float8_e4m3fn,
     torch.float8_e5m2,
