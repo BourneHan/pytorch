@@ -94,7 +94,7 @@ class GemmEpilogueIRFinalizer:
     kind: str
 
 
-def _expression_values(value: Any):
+def _expression_values(value: object):
     if isinstance(value, GemmEpilogueIRExpression):
         yield value
     elif isinstance(value, (tuple, list)):
@@ -188,7 +188,7 @@ class _GemmEpilogueIRHandler(DefaultHandler):
         self.stores[name] = GemmEpilogueIRStore(index, value)
 
 
-def _loaded_names(expr: Any) -> frozenset[str]:
+def _loaded_names(expr: object) -> frozenset[str]:
     if not isinstance(expr, GemmEpilogueIRExpression):
         return frozenset()
     if expr.op == "load":
@@ -312,7 +312,7 @@ class GemmEpilogueIRAnalysis:
         )
 
 
-def _constant_value(expr: Any) -> Any | None:
+def _constant_value(expr: object) -> Any | None:
     if not isinstance(expr, GemmEpilogueIRExpression):
         return None
     if expr.op in ("constant", "index_expr") and expr.args:
@@ -322,7 +322,7 @@ def _constant_value(expr: Any) -> Any | None:
     return None
 
 
-def _strip_conversions(expr: Any) -> Any:
+def _strip_conversions(expr: object) -> Any:
     while (
         isinstance(expr, GemmEpilogueIRExpression)
         and expr.op in ("to_dtype", "to_dtype_bitcast", "identity")
@@ -332,7 +332,7 @@ def _strip_conversions(expr: Any) -> Any:
     return expr
 
 
-def _walk(expr: Any):
+def _walk(expr: object):
     if not isinstance(expr, GemmEpilogueIRExpression):
         return
     yield expr
@@ -377,7 +377,7 @@ def operation_names_ir(store: GemmEpilogueIRStore) -> frozenset[str]:
 
 
 def _source_transform(
-    expr: Any,
+    expr: object,
     source_name: str,
     allowed_conversion_dtypes: frozenset[torch.dtype] | None = None,
 ) -> str | None:
@@ -425,7 +425,7 @@ def _source_transform(
     return None
 
 
-def _flatten_associative(expr: Any, op: str) -> list[Any]:
+def _flatten_associative(expr: object, op: str) -> list[Any]:
     stripped = _strip_conversions(expr)
     if isinstance(stripped, GemmEpilogueIRExpression) and stripped.op == op:
         return _flatten_associative(stripped.args[0], op) + _flatten_associative(
@@ -572,7 +572,7 @@ def is_absmax_scale_finalizer_ir(store: GemmEpilogueIRStore, source_name: str) -
     return False
 
 
-def _contains_reduction(expr: Any) -> bool:
+def _contains_reduction(expr: object) -> bool:
     if not isinstance(expr, GemmEpilogueIRExpression):
         return False
     return expr.op == "reduction" or any(_contains_reduction(arg) for arg in expr.args)
@@ -685,7 +685,7 @@ def single_source_affine_ir(
     return coefficients[0], coefficients[2]
 
 
-def _affine_around(expr: Any, basis) -> tuple[float, float] | None:
+def _affine_around(expr: object, basis) -> tuple[float, float] | None:
     expr = _strip_conversions(expr)
     if basis(expr):
         return 1.0, 0.0
@@ -718,21 +718,21 @@ def _affine_around(expr: Any, basis) -> tuple[float, float] | None:
     return None
 
 
-def _is_source(expr: Any, source_name: str) -> bool:
+def _is_source(expr: object, source_name: str) -> bool:
     return _source_transform(expr, source_name) == "identity"
 
 
-def _sum_terms(expr: Any, source_name: str, group: int) -> bool:
+def _sum_terms(expr: object, source_name: str, group: int) -> bool:
     terms = _flatten_associative(expr, "add")
     return len(terms) == group and all(_is_source(term, source_name) for term in terms)
 
 
-def _group_max(expr: Any, source_name: str, group: int) -> bool:
+def _group_max(expr: object, source_name: str, group: int) -> bool:
     terms = _flatten_associative(expr, "maximum")
     return len(terms) == group and all(_is_source(term, source_name) for term in terms)
 
 
-def _stable_group_max(expr: Any, source_name: str, group: int) -> bool:
+def _stable_group_max(expr: object, source_name: str, group: int) -> bool:
     """Match max(xs), including logsumexp's where(isinf(max), 0, max)."""
     expr = _strip_conversions(expr)
     if _group_max(expr, source_name, group):
@@ -764,7 +764,7 @@ def _stable_group_max(expr: Any, source_name: str, group: int) -> bool:
     return False
 
 
-def _shifted_exp(expr: Any, source_name: str) -> Any | None:
+def _shifted_exp(expr: object, source_name: str) -> Any | None:
     expr = _strip_conversions(expr)
     if not (
         isinstance(expr, GemmEpilogueIRExpression) and expr.op == "exp" and expr.args
@@ -847,7 +847,7 @@ def _sum_affine_ir(
     reduction_names: frozenset[str],
     group: int,
 ) -> tuple[float, float] | None:
-    def is_sum(candidate: Any) -> bool:
+    def is_sum(candidate: object) -> bool:
         candidate = _strip_conversions(candidate)
         return (
             isinstance(candidate, GemmEpilogueIRExpression)
@@ -867,7 +867,7 @@ def sum_normalize_consumer_type_ir(
     """Classify normalization by a primitive or unrolled grouped sum."""
     parameters: tuple[str, float, float] | None = None
 
-    def is_normalization(expr: Any) -> bool:
+    def is_normalization(expr: object) -> bool:
         nonlocal parameters
         expr = _strip_conversions(expr)
         if not isinstance(expr, GemmEpilogueIRExpression):
@@ -942,7 +942,7 @@ def variance_parameters_ir(
 ) -> tuple[float, float] | None:
     """Match an unrolled grouped variance followed by an affine transform."""
 
-    def is_variance(expr: Any) -> bool:
+    def is_variance(expr: object) -> bool:
         expr = _strip_conversions(expr)
         if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "truediv":
             return False
