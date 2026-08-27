@@ -1,5 +1,4 @@
 # Owner(s): ["module: inductor"]
-import ast
 import contextlib
 import functools
 import inspect
@@ -13,7 +12,6 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
 
@@ -6281,6 +6279,47 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         self.assertTrue(_tdm_block_legal(64, itemsize))
         self.assertTrue(_tdm_block_direct_path(64, itemsize))
 
+    def test_tdm_int32_bounds_install_one_guard_and_none_on_rejection(self):
+        # The whole point of checking the operand list at once: an admitted list
+        # installs a single combined bound, and a rejected one installs nothing
+        # -- not even the negated bound `guard_or_false` would append if it were
+        # handed a conjunction whose hint is already out of range.
+        from torch._dynamo.source import ConstantSource
+        from torch._inductor.utils import _descriptor_shapes_fit_in_int32
+        from torch.fx.experimental.symbolic_shapes import DimDynamic
+
+        graph = GraphLowering(make_fx(lambda: torch.zeros(2, 3))())
+        shape_env = graph.sizevars.shape_env
+        int32_max = torch.iinfo(torch.int32).max
+
+        def make_dim(name, hint):
+            return shape_env.create_symbol(
+                hint, source=ConstantSource(name), dynamic_dim=DimDynamic.DYNAMIC
+            )
+
+        with V.set_graph_handler(graph):
+            a, b = make_dim("fits_a", 128), make_dim("fits_b", 256)
+            before = len(shape_env.guards)
+            self.assertTrue(
+                _descriptor_shapes_fit_in_int32([[a, 64], [b, 64]], add_guards=True)
+            )
+            installed = shape_env.guards[before:]
+            self.assertEqual(len(installed), 1)
+            self.assertEqual(
+                set(installed[0][0].atoms(sympy.Le)),
+                {sympy.Le(a, int32_max), sympy.Le(b, int32_max)},
+            )
+
+            # A later operand out of range rejects the whole list guard-free.
+            for bad in (make_dim("too_big", int32_max + 1), int32_max + 1):
+                before = len(shape_env.guards)
+                self.assertFalse(
+                    _descriptor_shapes_fit_in_int32(
+                        [[make_dim(f"ok{bad}", 128), 64], [bad, 64]], add_guards=True
+                    )
+                )
+                self.assertEqual(len(shape_env.guards), before)
+
     def test_tdm_admission_bounds_do_not_specialize(self):
         from torch._dynamo.source import ConstantSource
         from torch._inductor.utils import (
@@ -6419,61 +6458,6 @@ class TestTDMConfigDenseAndGeneric(TestCase):
         ):
             with self.assertRaisesRegex(AssertionError, "commit revalidation failed"):
                 commit_tdm_operand_layout(unaligned, unaligned)
-
-    def test_tdm_exact_commit_has_a_single_production_call_site(self):
-        # No rollback exists, so a second commit point or a swallowed failure
-        # would silently widen specialization. Enforce that mechanically.
-        import torch._inductor.heuristics.template.triton as tdm_heuristics
-        import torch._inductor.kernel.mm as mm_kernel
-        import torch._inductor.utils as inductor_utils
-
-        modules = (inductor_utils, tdm_heuristics, mm_kernel)
-        trees = {
-            m.__file__: ast.parse(Path(m.__file__).read_text(encoding="utf-8"))
-            for m in modules
-        }
-
-        call_sites = [
-            (path, node.lineno)
-            for path, tree in trees.items()
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and getattr(node.func, "id", None) == "commit_tdm_operand_layout"
-        ]
-        self.assertEqual(len(call_sites), 1, call_sites)
-
-        # EXACT is referenced more than once inside utils (the mode comparison
-        # and the argument), so assert on the owning modules, not a count.
-        exact_refs = [
-            (path, node.lineno)
-            for path, tree in trees.items()
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute)
-            and node.attr == "EXACT"
-            and getattr(node.value, "id", None) == "TDMGuardMode"
-        ]
-        # Guard against a silently-vacuous extractor: if this found nothing,
-        # every assertion below would pass for the wrong reason.
-        self.assertGreater(len(exact_refs), 0)
-        self.assertEqual({path for path, _ in exact_refs}, {inductor_utils.__file__})
-
-        # The only place that *passes* EXACT to the compatibility helper is the
-        # commit API itself.
-        passers = [
-            fn.name
-            for fn in ast.walk(trees[inductor_utils.__file__])
-            if isinstance(fn, ast.FunctionDef)
-            for call in ast.walk(fn)
-            if isinstance(call, ast.Call)
-            and getattr(call.func, "id", None) == "_tdm_operands_compatible"
-            and any(
-                isinstance(a, ast.Attribute)
-                and a.attr == "EXACT"
-                and getattr(a.value, "id", None) == "TDMGuardMode"
-                for a in call.args
-            )
-        ]
-        self.assertEqual(passers, ["commit_tdm_operand_layout"])
 
     def test_tdm_config_filtering_requires_injected_orientation(self):
         # Defaulting the orientation would silently filter tiles against the

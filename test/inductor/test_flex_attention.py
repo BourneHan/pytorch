@@ -724,12 +724,14 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
             graph.unaligned_buffers.remove("value")
             self.assertTrue(use_flex_tdm_descriptor(query, key, value))
 
-        # Only an admitted operand list installs bounds, one per operand.
+        # Only an admitted operand list installs bounds, and it installs exactly
+        # one combined guard covering every operand -- that is what makes the
+        # rejection above leave nothing behind.
         new_guards = graph.sizevars.shape_env.guards[guards_before:]
         int32_max = torch.iinfo(torch.int32).max
-        self.assertEqual(len(new_guards), 3)
+        self.assertEqual(len(new_guards), 1)
         self.assertEqual(
-            {guard[0] for guard in new_guards},
+            set(new_guards[0][0].atoms(sympy.Le)),
             {
                 sympy.Le(q_len, int32_max),
                 sympy.Le(kv_len, int32_max),

@@ -56,7 +56,6 @@ from ..utils import (
     use_nv_universal_gemm_template,
     use_triton_blackwell_tma_template,
     use_triton_scaling_template,
-    use_triton_tdm_scaled_template,
     use_triton_tdm_template,
     use_triton_template,
     use_triton_tma_template,
@@ -973,12 +972,6 @@ def get_scaling_options(
     )  # verify that shapes are supported by at least one existing pairing
 
 
-def _use_scaled_descriptor_template(mat_a, mat_b, layout) -> bool:
-    if torch.version.hip is not None:
-        return use_triton_tdm_scaled_template(mat_a, mat_b)
-    return use_triton_tma_template(mat_a, mat_b, output_layout=layout, add_guards=True)
-
-
 # Inductor has no template or extern choice that understands swizzled scale
 # layouts for _scaled_mm_v2 yet; defer those to the eager op. add_to_fallback_set
 # is False because this handler is invoked manually from the lowering below, not
@@ -1122,7 +1115,10 @@ def tuned_scaled_mm_v2(
 
         # TODO (paulzhan): There is no template that exists for bias and TMA
         # Don't run tma template currently if bias exist
-        if _use_scaled_descriptor_template(mat_a, mat_b, layout) and not bias:
+        if (
+            use_triton_tma_template(mat_a, mat_b, output_layout=layout, add_guards=True)
+            and not bias
+        ):
             overriders["SCALE_RECIPE_A"] = scale_option_a.value
             overriders["SCALE_RECIPE_B"] = scale_option_b.value
 
@@ -1296,7 +1292,10 @@ def tuned_scaled_mm(
 
         # TODO (paulzhan): There is no template that exists for bias and TMA
         # Don't run tma template currently if bias exist
-        if _use_scaled_descriptor_template(mat_a, mat_b, layout) and not bias:
+        if (
+            use_triton_tma_template(mat_a, mat_b, output_layout=layout, add_guards=True)
+            and not bias
+        ):
             overriders["SCALE_RECIPE_A"] = scale_option_a.value
             overriders["SCALE_RECIPE_B"] = scale_option_b.value
 
