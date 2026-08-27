@@ -10801,6 +10801,7 @@ class TestCudaAutocast(TestAutocast):
                 _ = torch.ones(10)
 
 
+@unittest.skipIf(torch.version.rocm == "10.1.0", "HIPRTC issue (AIRUNTIME-2707)")
 class TestCompileKernel(TestCase):
     @unittest.skipIf(not TEST_CUDA, "No CUDA")
     def test_compile_kernel(self):
@@ -11332,6 +11333,7 @@ class TestCompileKernel(TestCase):
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 class TestCudaDeviceParametrized(TestCase):
+    @unittest.skipIf(torch.version.rocm == "10.1.0", "HIPRTC issue (AIRUNTIME-2707)")
     @skipIfRocmVersionLessThan((7, 0))
     @skipCUDAIf(
         not SM70OrLater, "Compute capability >= SM70 required for relaxed ptx flag"
