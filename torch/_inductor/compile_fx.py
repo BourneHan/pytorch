@@ -116,6 +116,11 @@ from ..fx.graph import _PyTreeCodeGen
 from ..utils._triton import has_triton
 from . import config, distributed_autotune, metrics
 from .codegen.common import get_wrapper_codegen_for_device, init_backend_registration
+from .compile_option_registry import (
+    get_compile_option_route,
+    import_config_module,
+    patch_compile_options,
+)
 from .debug import DebugContext
 from .decomposition import select_decomp_table
 from .exc import InductorError
@@ -976,10 +981,16 @@ def fake_tensor_prop(
 
 # pass config dict back to user
 def get_patched_config_dict(
-    config_patches: str | dict[str, Any] | None = None,
+    config_patches: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    with config.patch(config_patches):
-        return config.get_config_copy()
+    with patch_compile_options(config_patches):
+        config_copy = config.get_config_copy()
+        for name in config_patches or {}:
+            route = get_compile_option_route(name)
+            if route is not None:
+                owner_config = import_config_module(route.module)
+                config_copy[name] = getattr(owner_config, route.key)
+        return config_copy
 
 
 @contextlib.contextmanager
@@ -3098,6 +3109,10 @@ def compile_fx(
     function orchestrates end-to-end compilation for the inductor backend when
     you use :func:`torch.compile`.
 
+    Entries of ``config_patches`` registered via
+    ``torch._inductor.compile_option_registry`` are patched onto their owning
+    ConfigModule instead of ``torch._inductor.config``.
+
     NB: This function TAKES OWNERSHIP of the input ``model_`` and can potentially
     mutate it!  Make a copy if you need to preserve the original GraphModule.
     """
@@ -3118,12 +3133,12 @@ def compile_fx(
         return model_
 
     if config_patches:
-        with config.patch(config_patches):
+        with patch_compile_options(config_patches):
             return compile_fx(
                 model_,
                 example_inputs_,
                 # need extra layer of patching as backwards is compiled out of scope
-                inner_compile=config.patch(config_patches)(inner_compile),
+                inner_compile=patch_compile_options(config_patches)(inner_compile),
                 decompositions=decompositions,
                 ignore_shape_env=ignore_shape_env,
                 compile_region_name=compile_region_name,

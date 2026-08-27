@@ -67,6 +67,7 @@ from torch._inductor.codegen.rocm.compile_command import (
     rocm_compile_command,
     rocm_compiler,
 )
+from torch._inductor.compile_option_registry import active_routed_configs
 from torch._inductor.compile_worker.utils import in_toplevel_process
 from torch._inductor.cpp_builder import (
     _LINKER_SCRIPT,
@@ -1695,6 +1696,11 @@ class FxGraphHashDetails:
             for device, custom_config in custom_backend_codegen_configs.items()
             if custom_config is not None
         }
+
+        # Routed compile-option owner modules affect codegen like any config;
+        # hash the routed values this compile set so compiles differing only
+        # in routed option values do not collide.
+        self.routed_compile_option_configs = active_routed_configs()
 
         # Register the custom partitioner function
         self._custom_partitioner_fn = self._get_custom_partitioner_fn_detail(
