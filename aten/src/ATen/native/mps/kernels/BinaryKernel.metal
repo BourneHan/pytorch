@@ -269,6 +269,17 @@ struct laguerre_polynomial_l_functor {
   }
 };
 
+struct legendre_polynomial_p_functor {
+  template <typename T, enable_if_t<is_floating_point_v<T>, bool> = true>
+  inline T operator()(const T a, const T b) {
+    return static_cast<T>(c10::metal::legendre_polynomial_p_forward(a, b));
+  }
+  template <typename T, enable_if_t<is_integral_v<T>, bool> = true>
+  inline float operator()(const T a, const T b) {
+    return c10::metal::legendre_polynomial_p_forward(float(a), float(b));
+  }
+};
+
 struct nextafter_functor {
   template <typename T>
   inline T operator()(const T a, const T b) {
@@ -651,6 +662,8 @@ REGISTER_INTEGER_BINARY_OP(mul);
 REGISTER_FLOAT_BINARY_OP(sub);
 REGISTER_INTEGER_BINARY_OP(sub);
 REGISTER_OPMATH_FLOAT_BINARY_OP(div_floor);
+REGISTER_FLOAT_BINARY_OP(legendre_polynomial_p);
+REGISTER_INT2FLOAT_BINARY_OP(legendre_polynomial_p);
 REGISTER_INTEGER_BINARY_OP(div_floor);
 REGISTER_FLOAT_BINARY_OP(div_trunc);
 REGISTER_INTEGER_BINARY_OP(div_trunc);
