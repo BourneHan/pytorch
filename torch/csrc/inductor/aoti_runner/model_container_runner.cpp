@@ -94,7 +94,8 @@ AOTIModelContainerRunner::AOTIModelContainerRunner(
     size_t num_models,
     const std::string& device_str,
     const std::string& cubin_dir,
-    const bool run_single_threaded) {
+    const bool run_single_threaded)
+    : run_single_threaded_(run_single_threaded) {
   if (run_single_threaded) {
     TORCH_CHECK(
         num_models == 1,
@@ -250,6 +251,65 @@ AOTIModelContainerRunner::~AOTIModelContainerRunner() {
         result == AOTI_RUNTIME_SUCCESS,
         "AOTInductorModelContainerDelete failed");
   }
+}
+
+void AOTIModelContainerRunner::set_use_stream_affinity(
+    bool use_stream_affinity) {
+  TORCH_CHECK(
+      !use_stream_affinity || !run_single_threaded_,
+      "use_stream_affinity cannot be enabled when run_single_threaded is true");
+  TORCH_CHECK(
+      model_so_ != nullptr,
+      "Stream affinity is unavailable for custom AOTI device runners");
+  decltype(&AOTInductorModelContainerSetUseStreamAffinity) set_affinity_func =
+      nullptr;
+  try {
+    set_affinity_func = reinterpret_cast<decltype(set_affinity_func)>(
+        model_so_->sym("AOTInductorModelContainerSetUseStreamAffinity"));
+  } catch (const at::DynamicLibraryError&) {
+    // Report the missing optional symbol below with upgrade guidance.
+  }
+  TORCH_CHECK(
+      set_affinity_func != nullptr,
+      "AOTInductorModelContainerSetUseStreamAffinity is unavailable. "
+      "Rebuild the model with the latest AOTInductor.");
+  const auto result = set_affinity_func(container_handle_, use_stream_affinity);
+  if (result != AOTI_RUNTIME_SUCCESS) {
+    const char* aoti_err = nullptr;
+    if (get_last_error_func_ &&
+        get_last_error_func_(&aoti_err) == AOTI_RUNTIME_SUCCESS && aoti_err &&
+        aoti_err[0]) {
+      throw std::runtime_error(aoti_err);
+    }
+    torch::headeronly::detail::throw_exception(
+        "set_affinity_func(...)", __FILE__, __LINE__);
+  }
+}
+
+int64_t AOTIModelContainerRunner::get_stream_affinity_model_index(
+    void* stream_handle) {
+  TORCH_CHECK(
+      model_so_ != nullptr,
+      "Stream affinity diagnostics are unavailable for custom AOTI device "
+      "runners");
+  decltype(&AOTInductorModelContainerGetStreamAffinityModelIndex)
+      get_binding_func = nullptr;
+  try {
+    get_binding_func = reinterpret_cast<decltype(get_binding_func)>(
+        model_so_->sym("AOTInductorModelContainerGetStreamAffinityModelIndex"));
+  } catch (const at::DynamicLibraryError&) {
+    // Report the missing optional symbol below with upgrade guidance.
+  }
+  TORCH_CHECK(
+      get_binding_func != nullptr,
+      "AOTInductorModelContainerGetStreamAffinityModelIndex is unavailable. "
+      "Rebuild the model with the latest AOTInductor.");
+  int64_t model_index = -1;
+  AOTI_RUNTIME_ERROR_CODE_CHECK(get_binding_func(
+      container_handle_,
+      reinterpret_cast<AOTInductorStreamHandle>(stream_handle),
+      &model_index));
+  return model_index;
 }
 
 std::vector<at::Tensor> AOTIModelContainerRunner::run_impl(

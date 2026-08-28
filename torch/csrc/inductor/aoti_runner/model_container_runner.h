@@ -70,6 +70,8 @@ class TORCH_API AOTIModelContainerRunner {
   void free_inactive_constant_buffer();
   void update_constant_buffer_from_blob(const std::string& weights_path);
   bool did_call_load_constants() const;
+  void set_use_stream_affinity(bool use_stream_affinity);
+  int64_t get_stream_affinity_model_index(void* stream_handle);
 
   std::vector<std::string> get_call_spec();
 
@@ -194,6 +196,7 @@ class TORCH_API AOTIModelContainerRunner {
       const std::string& device_str,
       bool run_single_threaded);
 
+  bool run_single_threaded_{false};
   std::unique_ptr<torch::aot_inductor::ProxyExecutor> proxy_executor_;
 
   // Private, not protected: the lifetime argument in set_observer() only holds

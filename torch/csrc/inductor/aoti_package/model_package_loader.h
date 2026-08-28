@@ -14,6 +14,15 @@ class TORCH_API AOTIModelPackageLoader {
       const bool run_single_threaded = false,
       const size_t num_runners = 1,
       const c10::DeviceIndex device_index = -1);
+  // Keep the existing constructor's mangled symbol stable for ABI
+  // compatibility; the new option therefore uses a separate overload.
+  AOTIModelPackageLoader(
+      const std::string& model_package_path,
+      const std::string& model_name,
+      const bool run_single_threaded,
+      const size_t num_runners,
+      const c10::DeviceIndex device_index,
+      const bool use_stream_affinity);
   ~AOTIModelPackageLoader();
 
   AOTIModelContainerRunner* get_runner();
