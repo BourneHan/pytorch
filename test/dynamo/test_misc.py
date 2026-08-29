@@ -10798,9 +10798,9 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
             get_instruction_source_311(f.__code__, insts[op_offset]),
             """\
             a = ("🔥🔥🔥" +
-                ~~~~~~~~
+                ~~~~~~~~~~~
                 + "🔥🔥") + b
-                ~~~~~~~~^~~
+                ~~~~~~~~~~^~~
 """,
         )
 
