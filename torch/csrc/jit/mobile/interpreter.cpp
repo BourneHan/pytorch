@@ -95,7 +95,7 @@ bool InterpreterState::run(Stack& stack) {
 
       // std::cout << "RUNNING " << pc << ' ' << code.instructions_[pc];
       // if (inst.op == OP) {
-      //   std::cout << ", " << code.op_names_[inst.X].name;
+      //   std::cout << ", " << code.op_names_[inst.X].name();
       //   if (!code.op_names_[inst.X].overload_name.empty()) {
       //     std::cout << '.' << code.op_names_[inst.X].overload_name;
       //   }
@@ -131,7 +131,7 @@ bool InterpreterState::run(Stack& stack) {
             TORCH_CHECK(false, "Can't load op with index: ", inst.X);
           }
           RECORD_EDGE_SCOPE_WITH_DEBUG_HANDLE_AND_INPUTS(
-              code.op_names_[inst.X].name, debug_handle, stack);
+              code.op_names_[inst.X].name(), debug_handle, stack);
           code.operators_[inst.X](stack);
           frame.step();
         } break;
@@ -143,7 +143,7 @@ bool InterpreterState::run(Stack& stack) {
           }
           stack.emplace_back(inst.N);
           RECORD_EDGE_SCOPE_WITH_DEBUG_HANDLE_AND_INPUTS(
-              code.op_names_[inst.X].name, debug_handle, stack);
+              code.op_names_[inst.X].name(), debug_handle, stack);
           code.operators_[inst.X](stack);
           frame.step();
         } break;

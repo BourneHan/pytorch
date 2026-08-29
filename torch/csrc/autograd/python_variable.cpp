@@ -1142,7 +1142,7 @@ class NativeOpSchema {
   // Format schema as string for logging
   std::string format_inputs() const {
     std::ostringstream ss;
-    ss << op_.operator_name().name;
+    ss << op_.operator_name().name();
     if (!op_.operator_name().overload_name.empty()) {
       ss << '.' << op_.operator_name().overload_name;
     }
@@ -1337,10 +1337,8 @@ static bool is_default_overload(const std::string& overload_name) {
 static bool is_random_op(const c10::OperatorHandle& op) {
   // NOTE: must stay in sync with _random_ops in
   // torch/distributed/tensor/_dispatch.py
-  constexpr auto aten_namespace_prefix_len = 6;
   const auto& op_name = op.operator_name();
-  if (op_name.name.size() <= aten_namespace_prefix_len ||
-      memcmp(op_name.name.data(), "aten::", aten_namespace_prefix_len) != 0) {
+  if (op_name.getNamespace() != "aten") {
     return false;
   }
   static constexpr auto random_names = std::to_array<std::string_view>({
@@ -1351,9 +1349,7 @@ static bool is_random_op(const c10::OperatorHandle& op) {
       "uniform_",
       "bernoulli",
   });
-  std::string_view name_without_namespace(
-      op_name.name.c_str() + aten_namespace_prefix_len,
-      op_name.name.size() - aten_namespace_prefix_len);
+  const std::string_view name_without_namespace = op_name.getBaseName();
   if (name_without_namespace == "bernoulli_") {
     return op_name.overload_name == "float";
   }
@@ -1619,12 +1615,12 @@ py::object dispatchDTensorOp(
         py_op_info.ptr());
   }
 
-  const auto& operator_name = op.operator_name();
+  const std::string_view operator_name = op.operator_name().name();
   // Simple analysis of function schema to determine if this is an
   // inplace variant. It might not be entirely correct, but it's good
   // enough for now.
   const bool is_inplace_op =
-      !operator_name.name.empty() && operator_name.name.back() == '_';
+      !operator_name.empty() && operator_name.back() == '_';
   const auto& schema_arguments = op.schema().arguments();
   const bool is_out_variant_op = !is_inplace_op &&
       std::any_of(
@@ -1637,7 +1633,7 @@ py::object dispatchDTensorOp(
       cached_sharding.attr(dtensor_interned_strings.output_spec);
   if (!is_inplace_op && !is_out_variant_op &&
       !(output_spec.is_none() &&
-        (op.operator_name().name == "aten::equal" &&
+        (operator_name == "aten::equal" &&
          is_default_overload(op.operator_name().overload_name)))) {
     const auto wrap = get_dtensor_dispatcher_wrap();
     auto wrapped_result = checked_vectorcall(

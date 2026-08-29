@@ -116,7 +116,7 @@ static void basicAutogradNotImplementedFallbackImpl(
     c10::DispatchKeySet dispatch_keys,
     torch::jit::Stack* stack) {
   const auto& schema = op.schema();
-  const auto& op_name = schema.operator_name().name;
+  const auto& op_name = schema.operator_name().name();
   const auto num_arguments = schema.arguments().size();
   const auto num_returns = schema.returns().size();
   const auto stack_start = stack->size() - num_arguments;
@@ -257,7 +257,7 @@ static void autogradNotImplementedFallbackImpl(
   // Mimics a subset of the logic of a VariableType NotImplemented kernel
   // See gen_variable_type.py
   const auto& schema = op.schema();
-  const auto& op_name = schema.operator_name().name;
+  const auto& op_name = schema.operator_name().name();
   const auto num_arguments = schema.arguments().size();
   const auto num_returns = schema.returns().size();
   const auto stack_start = stack->size() - num_arguments;
@@ -588,7 +588,7 @@ static void autogradNotImplementedInplaceOrViewFallbackImpl(
   // inplace
   //   that is not allowed in the gen_inplace_or_view logic
   const auto& schema = op.schema();
-  const auto& op_name = schema.operator_name().name;
+  const auto& op_name = schema.operator_name().name();
   const auto num_arguments = schema.arguments().size();
   const auto num_returns = schema.returns().size();
   const auto stack_start = stack->size() - num_arguments;

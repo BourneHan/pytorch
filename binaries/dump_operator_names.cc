@@ -37,7 +37,7 @@ void dump_opnames(const Module& m, std::unordered_set<std::string>& opnames) {
       auto node = code.instructions_source()[i];
       if (ins.op == OpCode::OP) {
         auto opname = node->schema().operator_name();
-        std::string namestr = opname.name;
+        std::string namestr = opname.name();
         if (!opname.overload_name.empty())
           namestr += "." + opname.overload_name;
         std::cout << "    " << namestr << std::endl;

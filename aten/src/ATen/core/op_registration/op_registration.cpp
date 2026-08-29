@@ -39,7 +39,7 @@ void RegisterOperators::checkSchemaAndRegisterOp_(Options&& options) {
     FunctionSchema inferred_schema = inferSchemaFromKernels_(name, options);
 
     options.schemaOrName_ = FunctionSchema(
-        std::move(name.name),
+        name.name(),
         std::move(name.overload_name),
         inferred_schema.arguments(),
         inferred_schema.returns(),

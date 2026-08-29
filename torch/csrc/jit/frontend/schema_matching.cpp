@@ -663,9 +663,9 @@ static Value* emitBuiltinNode(
 
 std::string getFullSchemaName(const ::c10::FunctionSchema& schema) {
   if (!schema.overload_name().empty()) {
-    return schema.operator_name().name + "." + schema.overload_name();
+    return schema.operator_name().name() + "." + schema.overload_name();
   }
-  return schema.operator_name().name;
+  return schema.operator_name().name();
 }
 
 // Search for operators matching the provided symbol name and input types.

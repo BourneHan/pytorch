@@ -52,7 +52,7 @@ std::unordered_map<std::string, OperatorInfo> _get_runtime_ops_and_info() {
     if (op_handle->hasSchema()) {
       num_schema_args = op_handle->schema().arguments().size();
     }
-    auto op_name = op.name;
+    auto op_name = op.name();
     if (!op.overload_name.empty()) {
       op_name += ("." + op.overload_name);
     }

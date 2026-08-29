@@ -97,7 +97,7 @@ struct SchemaParser {
     }
 
     return FunctionSchema(
-        std::move(name.name),
+        name.name(),
         std::move(name.overload_name),
         std::move(arguments),
         std::move(returns),

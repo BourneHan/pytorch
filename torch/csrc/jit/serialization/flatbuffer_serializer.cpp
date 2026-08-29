@@ -264,7 +264,7 @@ flatbuffers::Offset<mobile::serialization::Function> FlatbufferSerializer::
     const int op_size = code.operator_input_sizes_[i];
     operator_vector.push_back(CreateOperator(
         fbb,
-        fbb.CreateSharedString(opname.name),
+        fbb.CreateSharedString(opname.name()),
         fbb.CreateSharedString(opname.overload_name),
         op_size));
   }

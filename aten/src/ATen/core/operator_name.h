@@ -13,12 +13,18 @@
 namespace c10 {
 
 struct OperatorName final {
-  std::string name;
   std::string overload_name;
   OperatorName(std::string name, std::string overload_name)
-      : name(std::move(name)),
-        overload_name(std::move(overload_name)),
-        namespace_sep_(this->name.find("::")) {}
+      : overload_name(std::move(overload_name)),
+        name_(std::move(name)),
+        namespace_sep_(name_.find("::")) {}
+
+  friend bool operator==(const OperatorName&, const OperatorName&) = default;
+
+  // Fully-qualified name, e.g. "aten::add".
+  const std::string& name() const {
+    return name_;
+  }
 
   // Return the namespace of this OperatorName, if it exists.  The
   // returned string_view is only live as long as the OperatorName
@@ -27,18 +33,16 @@ struct OperatorName final {
     if (namespace_sep_ == std::string::npos) {
       return std::nullopt;
     } else {
-      return std::string_view(name.data(), namespace_sep_);
+      return std::string_view(name_.data(), namespace_sep_);
     }
   }
 
-  // Return the part of name after the namespace prefix, if any (e.g. "add"
-  // for "aten::add"), otherwise the whole name. The returned string_view is
-  // only live as long as the OperatorName exists and name is not mutated.
+  // Part of name after the namespace prefix, e.g. "add" for "aten::add".
   std::string_view getBaseName() const {
     if (namespace_sep_ == std::string::npos) {
-      return name;
+      return name_;
     } else {
-      return std::string_view(name).substr(namespace_sep_ + 2);
+      return std::string_view(name_).substr(namespace_sep_ + 2);
     }
   }
 
@@ -46,15 +50,15 @@ struct OperatorName final {
   bool setNamespaceIfNotSet(const char* ns) {
     if (!getNamespace().has_value()) {
       const auto ns_len = strlen(ns);
-      const auto old_name_size = name.size();
-      name.resize(ns_len + 2 + old_name_size);
+      const auto old_name_size = name_.size();
+      name_.resize(ns_len + 2 + old_name_size);
       // Shift current value of name to the end of the new space.
-      auto name_data = name.data();
+      auto name_data = name_.data();
       std::char_traits<char>::move(
           name_data + ns_len + 2, name_data, old_name_size);
       std::char_traits<char>::copy(name_data, ns, ns_len);
-      name[ns_len] = ':';
-      name[ns_len + 1] = ':';
+      name_[ns_len] = ':';
+      name_[ns_len + 1] = ':';
       namespace_sep_ = ns_len;
       return true;
     } else {
@@ -63,10 +67,11 @@ struct OperatorName final {
   }
 
  private:
-  // Byte offset of the "::" namespace separator in `name`, or
-  // std::string::npos if `name` has no namespace. Computed once at
-  // construction (and updated by setNamespaceIfNotSet) instead of doing a
-  // linear scan on every getNamespace()/getBaseName() call.
+  // Private so namespace_sep_ can only go stale via the constructor or
+  // setNamespaceIfNotSet, both of which keep it in sync.
+  std::string name_;
+  // Cached byte offset of "::" in name_ (or npos), to avoid rescanning on
+  // every getNamespace()/getBaseName() call.
   std::string::size_type namespace_sep_;
 };
 
@@ -91,14 +96,6 @@ struct OperatorNameView final {
   }
 };
 
-inline bool operator==(const OperatorName& lhs, const OperatorName& rhs) {
-  return lhs.name == rhs.name && lhs.overload_name == rhs.overload_name;
-}
-
-inline bool operator!=(const OperatorName& lhs, const OperatorName& rhs) {
-  return !operator==(lhs, rhs);
-}
-
 TORCH_API std::string toString(const OperatorName& opName);
 TORCH_API std::ostream& operator<<(std::ostream& /*os*/, const OperatorName& /*opName*/);
 
@@ -108,7 +105,7 @@ namespace std {
 template <>
 struct hash<::c10::OperatorName> {
   size_t operator()(const ::c10::OperatorName& x) const noexcept {
-    return std::hash<std::string>()(x.name) ^
+    return std::hash<std::string>()(x.name()) ^
         (~std::hash<std::string>()(x.overload_name));
   }
 };

@@ -1136,7 +1136,7 @@ void initDispatchBindings(PyObject* module) {
     names.reserve(op_names.size());
     for (auto& op : op_names) {
       std::stringstream ss;
-      ss << op.name;
+      ss << op.name();
       if (!op.overload_name.empty()) {
         ss << '.' << op.overload_name;
       }
@@ -1420,7 +1420,7 @@ void initDispatchBindings(PyObject* module) {
         names.reserve(op_names.size());
         for (auto& op : op_names) {
           names.emplace_back(
-              op.name +
+              op.name() +
               (op.overload_name.empty() ? "" : "." + op.overload_name));
         }
         return names;

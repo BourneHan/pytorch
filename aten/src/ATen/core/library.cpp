@@ -197,7 +197,7 @@ Library& Library::_def(std::variant<c10::OperatorName, c10::FunctionSchema>&& na
         "Please explicitly provide a schema string.  ",
         ERROR_CONTEXT
       );
-      c10::FunctionSchema s = f.schema_->cloneWithName(std::move(name.name), std::move(name.overload_name));
+      c10::FunctionSchema s = f.schema_->cloneWithName(name.name(), std::move(name.overload_name));
       s.setAliasAnalysis(c10::AliasAnalysisKind::CONSERVATIVE);
       return s;
     }

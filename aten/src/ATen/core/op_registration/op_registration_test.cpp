@@ -2025,7 +2025,7 @@ TEST(NewOperatorRegistrationTest, testImplNoDefGetsCaught) {
                           " the TORCH_LIBRARY macro. Suspect operators:\n";
   for (auto& op : danglingImpls) {
       auto& op_name = op.operator_name();
-      error_str += "\t" + op_name.name;
+      error_str += "\t" + op_name.name();
       if (op_name.overload_name != "") {
           error_str += "." + op_name.overload_name;
       }

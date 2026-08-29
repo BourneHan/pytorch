@@ -450,7 +450,7 @@ std::vector<std::shared_ptr<Operator>> getAllSortedOperatorsFor(Symbol name) {
 
 std::shared_ptr<Operator> findOperatorFor(const c10::OperatorName& full_name) {
   for (const auto& op :
-       getRegistry().getOperators(Symbol::fromQualString(full_name.name))) {
+       getRegistry().getOperators(Symbol::fromQualString(full_name.name()))) {
     if (op->schema().overload_name() == full_name.overload_name) {
       return op;
     }

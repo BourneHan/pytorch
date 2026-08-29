@@ -963,15 +963,15 @@ py::handle getTorchApiFunction(const c10::OperatorHandle& op) {
     const auto& operator_name = op.operator_name();
     const auto& overload_name = schema.overload_name();
     auto ns = operator_name.getNamespace();
-    TORCH_INTERNAL_ASSERT(ns.has_value(), operator_name.name);
+    TORCH_INTERNAL_ASSERT(ns.has_value(), operator_name.name());
     // Make me some null terminated strings
     std::string ns_str(*ns);
     std::string func_name(operator_name.getBaseName());
 
     py::handle torch_api_function = py::module::import("torch")
-                                         .attr("ops")
-                                         .attr(ns_str.c_str())
-                                         .attr(func_name.c_str());
+                                        .attr("ops")
+                                        .attr(ns_str.c_str())
+                                        .attr(func_name.c_str());
     if (overload_name.empty()) {
       return torch_api_function.attr("default").ptr();
     } else {

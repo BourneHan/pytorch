@@ -355,7 +355,7 @@ struct TORCH_API FunctionSchema {
     return name_;
   }
   const std::string& name() const {
-    return name_.name;
+    return name_.name();
   }
   const std::string& overload_name() const {
     return name_.overload_name;

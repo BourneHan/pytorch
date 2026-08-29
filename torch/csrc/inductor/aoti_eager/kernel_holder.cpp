@@ -561,7 +561,7 @@ std::string AOTIPythonKernelHolder::produce_aoti_kernel_lib(
   auto arguments = torch::jit::last(*stack, op.schema().arguments().size());
 
   const auto& schema = op.schema();
-  const auto& qualified_name = op.operator_name().name;
+  const auto& qualified_name = op.operator_name().name();
   const auto& overload_name =
       schema.overload_name().empty() ? "default" : schema.overload_name();
   auto pos = qualified_name.find("::");
@@ -589,7 +589,7 @@ std::string AOTIPythonKernelHolder::produce_aoti_kernel_lib(
   TORCH_INTERNAL_ASSERT(
       op_py_func.ptr() != nullptr && !Py_IsNone(op_py_func.ptr()),
       "Failed to get python operation. Operator Name is ",
-      op.operator_name().name,
+      op.operator_name().name(),
       ", Overload Name is ",
       overload_name);
 
@@ -622,7 +622,7 @@ std::string AOTIPythonKernelHolder::produce_aoti_kernel_lib(
       "Failed to produce kernel library by using AOTI for ",
       c10::DeviceTypeName(device_.type()),
       ". Operator Name is ",
-      op.operator_name().name,
+      op.operator_name().name(),
       ", Overload Name is ",
       op.schema().overload_name());
 

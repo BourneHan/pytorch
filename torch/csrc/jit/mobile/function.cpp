@@ -54,7 +54,7 @@ void Function::append_operator(
 }
 
 std::string operator_str(const c10::OperatorName& opname) {
-  std::string result = opname.name;
+  std::string result = opname.name();
   if (!opname.overload_name.empty()) {
     result += "." + opname.overload_name;
   }

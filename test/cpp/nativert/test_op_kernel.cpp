@@ -17,7 +17,7 @@ TEST(OpKernelTest, GetOperatorForTargetValid) {
   EXPECT_NO_THROW({
     c10::OperatorHandle handle = getOperatorForTarget(target);
     EXPECT_TRUE(handle.hasSchema());
-    EXPECT_EQ(handle.operator_name().name, "test::foo");
+    EXPECT_EQ(handle.operator_name().name(), "test::foo");
     EXPECT_EQ(handle.operator_name().overload_name, "");
   });
 }

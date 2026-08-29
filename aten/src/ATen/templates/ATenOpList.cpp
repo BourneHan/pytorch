@@ -31,6 +31,6 @@ bool is_custom_op(const c10::OperatorName& opName) {
     {"", ""}
   };
   return !ops.contains(std::make_pair(
-             opName.name.c_str(), opName.overload_name.c_str()));
+             opName.name().c_str(), opName.overload_name.c_str()));
 }
 }

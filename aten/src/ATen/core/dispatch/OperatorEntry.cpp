@@ -333,7 +333,7 @@ SafeKernelFunction OperatorEntry::getComputedKernelForDispatchKey(
   // Use findSchemaOrThrow to get OpHandle for the OperatorEntry
   auto& dispatcher = c10::Dispatcher::singleton();
   auto opHandle = dispatcher.findSchemaOrThrow(
-      name_.name.c_str(), name_.overload_name.c_str());
+      name_.name().c_str(), name_.overload_name.c_str());
 
   return SafeKernelFunction(
       &annotatedKernel.kernel,

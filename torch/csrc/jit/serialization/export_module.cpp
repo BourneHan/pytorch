@@ -181,10 +181,10 @@ std::pair<IValue, IValue> getFunctionTuple(
     const auto& opname = mobile_code.op_names_[i];
     const int size = mobile_code.operator_input_sizes_[i];
     if (BytecodeEmitMode::is_default_value_for_unspecified_arg_enabled()) {
-      operators.emplace_back(to_tuple({opname.name, opname.overload_name}));
+      operators.emplace_back(to_tuple({opname.name(), opname.overload_name}));
     } else {
       operators.emplace_back(
-          to_tuple({opname.name, opname.overload_name, size}));
+          to_tuple({opname.name(), opname.overload_name, size}));
     }
   }
 
@@ -939,8 +939,8 @@ void export_opnames(const script::Module& m, std::set<std::string>& opnames) {
   for (const auto& method : mobile_m.get_methods()) {
     for (const auto& op : method.function().get_code().op_names_) {
       opnames.emplace(
-          op.overload_name.empty() ? op.name
-                                   : op.name + "." + op.overload_name);
+          op.overload_name.empty() ? op.name()
+                                   : op.name() + "." + op.overload_name);
     }
   }
 }

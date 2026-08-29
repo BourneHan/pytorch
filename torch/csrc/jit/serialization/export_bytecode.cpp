@@ -271,10 +271,10 @@ IValue convertMobileFunctionToCodeTable(
     const auto& opname = code.op_names_[i];
     const int size = code.operator_input_sizes_[i];
     if (compilation_options.enable_default_value_for_unspecified_arg) {
-      operators.emplace_back(to_tuple({opname.name, opname.overload_name}));
+      operators.emplace_back(to_tuple({opname.name(), opname.overload_name}));
     } else {
       operators.emplace_back(
-          to_tuple({opname.name, opname.overload_name, size}));
+          to_tuple({opname.name(), opname.overload_name, size}));
     }
   }
 
@@ -346,8 +346,8 @@ static uint64_t get_min_operator_version_from_version_map(
   for (const auto& func : module.compilation_unit().methods()) {
     for (const auto& op_name : func->get_code().op_names_) {
       auto schema_name = op_name.overload_name.empty()
-          ? op_name.name
-          : op_name.name + "." + op_name.overload_name;
+          ? op_name.name()
+          : op_name.name() + "." + op_name.overload_name;
       auto version_entry = get_operator_version_map().find(schema_name);
       if (version_entry != get_operator_version_map().end()) {
         const auto& entry = version_entry->second;

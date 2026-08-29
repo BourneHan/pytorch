@@ -159,7 +159,7 @@ _get_runtime_ops_and_schema() {
     // grab schema
     const auto op_handle = c10::Dispatcher::singleton().findOp(op);
     if (op_handle->hasSchema()) {
-      auto op_name = op.name;
+      auto op_name = op.name();
       if (!op.overload_name.empty()) {
         op_name += ("." + op.overload_name);
       }
