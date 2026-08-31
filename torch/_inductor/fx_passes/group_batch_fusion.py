@@ -447,7 +447,7 @@ class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
 
     def fuse(self, graph: torch.fx.GraphModule, subset: list[torch.fx.Node]):
         batch_inputs, batch_others = [], []
-        alpha = subset[0].kwargs.get("alpha", DEFAULT_ALPHA)
+        kwargs = subset[0].kwargs
         batch_inputs_meta, batch_others_meta = [], []
 
         for node in subset:
@@ -470,17 +470,19 @@ class BatchPointwiseMathOpsPostGradFusion(BatchPointwiseOpsFusionFactory):
             batch_op = graph.call_function(  # type: ignore[operator]
                 self.op,
                 args=(stack_inputs, stack_others),
-                kwargs={"alpha": alpha} if self.op == aten.add.Tensor else {},
+                kwargs=kwargs,
             )
-            batch_op.meta["val"] = self.op(stack_inputs_meta, stack_others_meta)
-            for i, original_add in enumerate(subset):
+            batch_op.meta["val"] = self.op(
+                stack_inputs_meta, stack_others_meta, **kwargs
+            )
+            for i, original_node in enumerate(subset):
                 with graph.inserting_after(batch_op):  # type: ignore[operator]
-                    new_add = graph.call_function(  # type: ignore[operator]
+                    new_node = graph.call_function(  # type: ignore[operator]
                         torch.ops.aten.select, args=((batch_op, 0, i))
                     )
-                original_add.replace_all_uses_with(new_add)
-                new_add.meta.update(original_add.meta)
-                graph.erase_node(original_add)  # type: ignore[operator]
+                original_node.replace_all_uses_with(new_node)
+                new_node.meta.update(original_node.meta)
+                graph.erase_node(original_node)  # type: ignore[operator]
         counters["inductor"][
             "batch_aten_" + self.op.__name__.lower().split(".")[0]
         ] += 1
