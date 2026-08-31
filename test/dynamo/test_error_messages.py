@@ -27,6 +27,11 @@ from torch.testing._internal.common_utils import IS_FBCODE, munge_exc
 from torch.testing._internal.logging_utils import LoggingTestCase, make_logging_test
 
 
+device_type = (
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+)
+
+
 """
 NOTE Adding tests to this file:
 
@@ -1047,9 +1052,9 @@ from user code:
     return x + y""",
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @unittest.skipIf(not torch.accelerator.is_available(), "requires accelerator")
     def test_fx_node_error_cross_device(self):
-        linear = torch.nn.Linear(10, 20, device="cuda").eval()
+        linear = torch.nn.Linear(10, 20, device=device_type).eval()
 
         def fn(x):
             return linear(x)
@@ -1061,7 +1066,7 @@ from user code:
         self.assertIn("Tensor device mismatch", msg)
         self.assertIn("Expected all tensors to be on the same device", msg)
         self.assertIn("cpu", msg)
-        self.assertIn("cuda", msg)
+        self.assertIn(f"{device_type}", msg)
         self.assertNotIn("Dynamo failed to run FX node with fake tensors", msg)
         self.assertNotIn("Unhandled FakeTensor Device Propagation", msg)
 
