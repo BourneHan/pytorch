@@ -5290,6 +5290,9 @@ class SourcelessBuilder:
 
     @staticmethod
     def create(tx: "InstructionTranslatorBase", value: Any) -> VariableTracker:
+        from .ctx_manager import GenericContextWrappingVariable
+        from .user_defined import is_generic_ctx_manager_cls
+
         value_type = type(value)
         # type: ignore[attr-defined]
         fast_handler = SourcelessBuilder._type_handlers.get(value_type)
@@ -5374,12 +5377,17 @@ class SourcelessBuilder:
                 except NotImplementedError:
                     pass  # failthrough to unimplemented branch
             else:
-                # Instance method — look up the VT for __self__ via side effects
+                # Instance method - look up the VT for __self__ via side effects,
+                # falling back to building __self__ fresh (e.g. a closure cell
+                # holding a bound method of an object Dynamo never observed
+                # directly, such as a context manager captured by a
+                # @contextmanager-style decorator).
                 obj_vt = tx.output.side_effects.id_to_variable.get(id(value.__self__))
-                if obj_vt is not None:
-                    return torch._dynamo.variables.UserMethodVariable(
-                        value.__func__, obj_vt
-                    )
+                if obj_vt is None:
+                    obj_vt = SourcelessBuilder.create(tx, value.__self__)
+                return torch._dynamo.variables.UserMethodVariable(
+                    value.__func__, obj_vt
+                )
         elif isinstance(value, torch.fx.graph_module.GraphModule):
             return SourcelessGraphModuleVariable(value)
         elif isinstance(
@@ -5441,6 +5449,12 @@ class SourcelessBuilder:
             return SliceVariable(items, tx)  # pyrefly: ignore[bad-argument-type]
         elif isinstance(value, torch.nn.parallel.distributed.DistributedDataParallel):
             return UnspecializedNNModuleVariable(value)
+        elif is_generic_ctx_manager_cls(type(value)):
+            # Mirrors VariableBuilder.wrap_user_defined and
+            # SideEffects.get_variable_cls: a context manager reached without
+            # a source (e.g. via a closure cell) still needs to wrap as a
+            # GenericContextWrappingVariable so `with`/decorator use works.
+            return GenericContextWrappingVariable(value)
         elif istype(value, object):
             return ObjectVariable(value)
         elif (

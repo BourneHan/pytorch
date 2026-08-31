@@ -1840,6 +1840,51 @@ class UserMethodVariable(UserFunctionVariable):
         if self.is_constant:
             fn = getattr(self.obj.value, self.fn.__name__)  # type: ignore[attr-defined]
             return invoke_and_store_as_constant(tx, fn, self.get_name(), args, kwargs)
+        if (
+            self.source is None
+            and not args
+            and not kwargs
+            and isinstance(
+                self.obj.value,  # type: ignore[attr-defined]
+                torch.utils._contextlib._DecoratorContextManager,
+            )
+            and self.fn.__name__ == "clone"
+            and self.fn is inspect.getattr_static(type(self.obj.value), "clone")  # type: ignore[attr-defined]
+        ):
+            # `_DecoratorContextManager.clone` (and subclass overrides like
+            # inference_mode.clone) construct and return a fresh copy of the
+            # context manager -- e.g. `self.__class__()` or
+            # `self.__class__(self.mode)`. Normally we'd inline this, but
+            # constructing a fresh instance inlines through
+            # UserDefinedClassVariable.call_function, which requires a
+            # `source` on the class reference (see user_defined.py). A bound
+            # `clone` method reached without a source (e.g. via a closure
+            # cell wrapping a context manager created outside the traced
+            # region -- see gh-194763) can't provide one. `clone` is
+            # documented as a pure copy with no side effects (see
+            # torch/utils/_contextlib.py), so call it eagerly in Python to
+            # get the real new instance instead of inlining its body, then
+            # wrap that concrete result the normal way.
+            from .builder import SourcelessBuilder
+            from .torch import TorchCtxManagerClassVariable
+
+            new_cm_obj = self.obj.value.clone()  # type: ignore[attr-defined]
+            cm_cls = type(new_cm_obj)
+            if TorchCtxManagerClassVariable.is_matching_cls(cm_cls):
+                # PyTorch-owned context managers like no_grad/inference_mode
+                # are represented specially (e.g. as GradModeVariable) rather
+                # than as a generic wrapped instance -- constructing one
+                # generically and inlining its __enter__/__exit__ would hit
+                # the MOD_SKIPLIST graph break for torch/autograd internals.
+                ctor_args = (
+                    [SourcelessBuilder.create(tx, new_cm_obj.mode)]
+                    if hasattr(new_cm_obj, "mode")
+                    else []
+                )
+                return TorchCtxManagerClassVariable(cm_cls).call_function(
+                    tx, ctor_args, {}
+                )
+            return SourcelessBuilder.create(tx, new_cm_obj)
         return super().call_function(tx, args, kwargs)
 
     def _get_func(self, tx: "InstructionTranslatorBase") -> VariableTracker:

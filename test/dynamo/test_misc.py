@@ -15845,6 +15845,42 @@ fn
         res = opt_fn(t)
         self.assertEqual(ref, res)
 
+    @parametrize("grad_mode_decorator", ["no_grad", "enable_grad", "inference_mode"])
+    def test_sourceless_bound_method_in_closure(self, grad_mode_decorator):
+        # Constructing an object inside the graph and calling a grad-mode
+        # decorated method on it (e.g. @torch.no_grad()) requires wrapping a
+        # bound method (the decorator's ctx_factory closure cell) whose
+        # __self__ was never observed directly by Dynamo, and then cloning
+        # that context manager (self.__class__() or self.__class__(mode))
+        # without a source to construct from. See gh-194763.
+        if grad_mode_decorator == "no_grad":
+
+            class A:
+                @torch.no_grad()
+                def method(self, x):
+                    return x + 1
+        elif grad_mode_decorator == "enable_grad":
+
+            class A:
+                @torch.enable_grad()
+                def method(self, x):
+                    return x + 1
+        else:
+
+            class A:
+                @torch.inference_mode()
+                def method(self, x):
+                    return x + 1
+
+        def fn(x):
+            return A().method(x)
+
+        x = torch.tensor(1.0, requires_grad=True)
+        ref = fn(x)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        res = opt_fn(x)
+        self.assertEqual(ref, res)
+
     def test_inspect_signature_parameters(self):
         import inspect
 
