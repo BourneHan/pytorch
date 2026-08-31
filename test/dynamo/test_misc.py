@@ -15845,7 +15845,10 @@ fn
         res = opt_fn(t)
         self.assertEqual(ref, res)
 
-    @parametrize("grad_mode_decorator", ["no_grad", "enable_grad", "inference_mode"])
+    @parametrize(
+        "grad_mode_decorator",
+        ["no_grad", "enable_grad", "inference_mode_true", "inference_mode_false"],
+    )
     def test_sourceless_bound_method_in_closure(self, grad_mode_decorator):
         # Constructing an object inside the graph and calling a grad-mode
         # decorated method on it (e.g. @torch.no_grad()) requires wrapping a
@@ -15865,10 +15868,16 @@ fn
                 @torch.enable_grad()
                 def method(self, x):
                     return x + 1
+        elif grad_mode_decorator == "inference_mode_true":
+
+            class A:
+                @torch.inference_mode(True)
+                def method(self, x):
+                    return x + 1
         else:
 
             class A:
-                @torch.inference_mode()
+                @torch.inference_mode(False)
                 def method(self, x):
                     return x + 1
 
@@ -15882,14 +15891,28 @@ fn
         self.assertEqual(ref, res)
         # Value equality alone doesn't exercise what these decorators
         # actually control; assert the grad-mode side effect matches too.
-        # NOTE: inference_mode is excluded here because of a pre-existing,
-        # unrelated bug where config.canonicalize_output_graph_node_order
-        # (set by this TestCase's setUpClass) causes the inference_mode
-        # context to be dropped from the compiled graph entirely. That
-        # reproduces identically for an instance constructed *outside* the
-        # traced region (the pre-existing, already-working sourced path
-        # this PR does not touch), so it is unrelated to gh-194763.
-        if grad_mode_decorator != "inference_mode":
+        # NOTE: under config.canonicalize_output_graph_node_order=True (set
+        # by this TestCase's setUpClass), the inference_mode cases are
+        # skipped here due to a pre-existing, unrelated bug where that
+        # config causes the inference_mode context to be dropped from the
+        # compiled graph entirely. That reproduces identically for an
+        # instance constructed *outside* the traced region (the
+        # pre-existing, already-working sourced path this PR does not
+        # touch), so it is unrelated to gh-194763. Asserted instead under
+        # the real-world default (canonicalize_output_graph_node_order=False)
+        # so the inference_mode.clone `.mode` branch this PR adds keeps
+        # real coverage for both mode=True and mode=False.
+        if grad_mode_decorator.startswith("inference_mode"):
+            with torch._dynamo.config.patch(canonicalize_output_graph_node_order=False):
+                torch._dynamo.reset()
+                res_default_config = torch.compile(fn, backend="eager", fullgraph=True)(
+                    x
+                )
+            self.assertEqual(ref.requires_grad, res_default_config.requires_grad)
+            self.assertEqual(
+                torch.is_inference(ref), torch.is_inference(res_default_config)
+            )
+        else:
             self.assertEqual(ref.requires_grad, res.requires_grad)
 
     def test_sourceless_bound_method_in_closure_set_grad_enabled_graph_breaks(self):
@@ -15915,7 +15938,9 @@ fn
         self.assertEqual(ref.requires_grad, res.requires_grad)
 
         torch._dynamo.reset()
-        with self.assertRaises(torch._dynamo.exc.Unsupported):
+        with self.assertRaisesRegex(
+            torch._dynamo.exc.Unsupported, "set_grad_enabled.clone"
+        ):
             torch.compile(fn, backend="eager", fullgraph=True)(x)
 
     def test_inspect_signature_parameters(self):

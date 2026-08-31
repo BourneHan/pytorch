@@ -1872,6 +1872,12 @@ class UserMethodVariable(UserFunctionVariable):
             if (
                 self.fn is torch.utils._contextlib._DecoratorContextManager.clone
                 and TorchCtxManagerClassVariable.is_matching_cls(cm_cls)
+                # _set_fwd_grad_enabled inherits the base zero-arg clone but
+                # its __init__ requires a positional `mode` -- clone() is
+                # already broken in eager for it (TypeError). Exclude it so
+                # the mismatch surfaces as a normal graph break instead of
+                # TorchCtxManagerClassVariable's internal arity assertion.
+                and cm_cls is not torch.autograd.forward_ad._set_fwd_grad_enabled
             ):
                 return TorchCtxManagerClassVariable(cm_cls).call_function(tx, [], {})
             if (
