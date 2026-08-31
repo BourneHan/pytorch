@@ -23,7 +23,6 @@ from torch.testing._internal.common_utils import (
     find_free_port,
     IS_WINDOWS,
     munge_exc,
-    skipIfRocmVersionAtLeast,
     skipIfTorchDynamo,
     skipIfWindows,
 )
@@ -1077,8 +1076,15 @@ Mutating object of type dict (source name: L['mod']._buffers)
         with self.assertRaises(ValueError):
             torch._logging.set_logs(aot_graphs=5)
 
-    @skipIfRocmVersionAtLeast([10, 1])  # AIPROFSDK-1066
     def test_invalid_artifact_flag_error_msg(self):
+        rocm = getattr(torch.version, "rocm", None)
+        if rocm:
+            mm = tuple(
+                int("".join(c for c in p if c.isdigit()) or 0)
+                for p in rocm.split("-", 1)[0].split(".")[:2]
+            )
+            if mm >= (10, 1):
+                self.skipTest("AIPROFSDK-1066")
         env = dict(os.environ)
         env["TORCH_LOGS"] = "not_an_existing_log_artifact_should_error"
         _, stderr = self.run_process_no_exception(
@@ -1426,8 +1432,15 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
             len([r for r in records if "return a + 1" in r.getMessage()]), 0
         )
 
-    @skipIfRocmVersionAtLeast([10, 1])  # AIPROFSDK-1066
     def test_logs_out(self):
+        rocm = getattr(torch.version, "rocm", None)
+        if rocm:
+            mm = tuple(
+                int("".join(c for c in p if c.isdigit()) or 0)
+                for p in rocm.split("-", 1)[0].split(".")[:2]
+            )
+            if mm >= (10, 1):
+                self.skipTest("AIPROFSDK-1066")
         import tempfile
 
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
