@@ -5494,6 +5494,10 @@ def inplace_constant_pad_nd(
     if len(padding) != 4 or len(x.get_size()) != 2:
         return None
 
+    # Bail out for symbolic padding, dynamic shapes
+    if not all(isinstance(p, int) for p in padding):
+        return None
+
     # No harm to realize since we already know that
     # the op can not be fused into the single user.
     # It need to be realized later anyways.
@@ -5525,7 +5529,7 @@ def inplace_constant_pad_nd(
         return None
 
     npad = padding[1]
-    if npad == 0:
+    if npad <= 0:
         return None
 
     stride0 = strides[0]
