@@ -15880,6 +15880,43 @@ fn
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         res = opt_fn(x)
         self.assertEqual(ref, res)
+        # Value equality alone doesn't exercise what these decorators
+        # actually control; assert the grad-mode side effect matches too.
+        # NOTE: inference_mode is excluded here because of a pre-existing,
+        # unrelated bug where config.canonicalize_output_graph_node_order
+        # (set by this TestCase's setUpClass) causes the inference_mode
+        # context to be dropped from the compiled graph entirely. That
+        # reproduces identically for an instance constructed *outside* the
+        # traced region (the pre-existing, already-working sourced path
+        # this PR does not touch), so it is unrelated to gh-194763.
+        if grad_mode_decorator != "inference_mode":
+            self.assertEqual(ref.requires_grad, res.requires_grad)
+
+    def test_sourceless_bound_method_in_closure_set_grad_enabled_graph_breaks(self):
+        # set_grad_enabled.clone() forwards a saved constructor arg and
+        # mutates real global autograd state as a side effect of
+        # construction (unlike no_grad/enable_grad/inference_mode's clone),
+        # so it must not be eagerly constructed while sourceless. It should
+        # graph-break cleanly under fullgraph=False, not silently drop the
+        # decorator's effect. See gh-194763.
+        class A:
+            @torch.set_grad_enabled(False)
+            def method(self, x):
+                return x + 1
+
+        def fn(x):
+            return A().method(x)
+
+        x = torch.tensor(1.0, requires_grad=True)
+        ref = fn(x)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=False)
+        res = opt_fn(x)
+        self.assertEqual(ref, res)
+        self.assertEqual(ref.requires_grad, res.requires_grad)
+
+        torch._dynamo.reset()
+        with self.assertRaises(torch._dynamo.exc.Unsupported):
+            torch.compile(fn, backend="eager", fullgraph=True)(x)
 
     def test_inspect_signature_parameters(self):
         import inspect
