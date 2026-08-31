@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import (
     munge_exc,
     skipIfTorchDynamo,
     skipIfWindows,
+    skipIfRocmVersionAtLeast,
 )
 from torch.testing._internal.inductor_utils import (
     HAS_CUDA_AND_TRITON,
@@ -1076,6 +1077,7 @@ Mutating object of type dict (source name: L['mod']._buffers)
         with self.assertRaises(ValueError):
             torch._logging.set_logs(aot_graphs=5)
 
+    @skipIfRocmVersionAtLeast([10, 1])  # AIPROFSDK-1066
     def test_invalid_artifact_flag_error_msg(self):
         env = dict(os.environ)
         env["TORCH_LOGS"] = "not_an_existing_log_artifact_should_error"
@@ -1424,6 +1426,7 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
             len([r for r in records if "return a + 1" in r.getMessage()]), 0
         )
 
+    @skipIfRocmVersionAtLeast([10, 1])  # AIPROFSDK-1066
     def test_logs_out(self):
         import tempfile
 
