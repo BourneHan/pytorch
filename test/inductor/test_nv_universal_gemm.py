@@ -123,6 +123,123 @@ def _nvgemm_config(**overrides):
 class TestNVUniversalGemm(TestCase):
     """Test cases for NVIDIA Universal GEMM functionality."""
 
+    def test_compile_preserves_wrapped_cute_compile_protocol(self):
+        import cutlass.cute as cute
+
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            _compile_nvgemm_kernel,
+        )
+
+        original_compile = cute.compile
+
+        def monitored_compile(*args, **kwargs):
+            return original_compile(*args, **kwargs)
+
+        monitored_compile.__wrapped__ = original_compile
+
+        class FakeKernel:
+            def compile(inner_self, args):
+                self.assertIs(cute.compile, original_compile)
+                return args
+
+        with mock.patch.object(cute, "compile", monitored_compile):
+            marker = object()
+            self.assertIs(_compile_nvgemm_kernel(FakeKernel(), marker), marker)
+            self.assertIs(cute.compile, monitored_compile)
+
+    def test_compile_serializes_subscriptable_cute_compile(self):
+        import cutlass.cute as cute
+
+        from torch._inductor.codegen.nv_universal_gemm import nv_universal_gemm_kernel
+
+        class FakeLock:
+            held = False
+
+            def __enter__(inner_self):
+                inner_self.held = True
+
+            def __exit__(inner_self, exc_type, exc_value, traceback):
+                inner_self.held = False
+
+        class SubscriptableCompile:
+            def __getitem__(self, options):
+                return options
+
+        lock = FakeLock()
+
+        class FakeKernel:
+            def compile(inner_self, args):
+                self.assertTrue(lock.held)
+                return args
+
+        with (
+            mock.patch.object(cute, "compile", SubscriptableCompile()),
+            mock.patch.object(nv_universal_gemm_kernel, "_NVGEMM_COMPILE_LOCK", lock),
+        ):
+            marker = object()
+            self.assertIs(
+                nv_universal_gemm_kernel._compile_nvgemm_kernel(FakeKernel(), marker),
+                marker,
+            )
+
+    def test_direct_epilogue_cache_signature_distinguishes_wrapped_tensors(self):
+        from cutlass.operators.utils.tensor import TensorWrapper
+
+        from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
+            _epilogue_args_signature,
+        )
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            CuTeDSLEpilogueArguments,
+        )
+
+        source = "def epilogue(accum, D):\n    return D"
+
+        def signature(tensor, alignment_bytes=16, *, preserve_layout=False):
+            args = CuTeDSLEpilogueArguments(source, D=tensor)
+            args.to_tensor_wrappers()
+            if preserve_layout or alignment_bytes != 16:
+                args.tensors["D"] = TensorWrapper(tensor, alignment_bytes)
+            return _epilogue_args_signature(args)
+
+        contiguous = torch.empty(4, 8, device="cuda", dtype=torch.bfloat16)
+        transposed = torch.empty(8, 4, device="cuda", dtype=torch.bfloat16).T
+        different_shape = torch.empty(8, 8, device="cuda", dtype=torch.bfloat16)
+        different_dtype = contiguous.float()
+        scalar = torch.empty((), device="cuda", dtype=torch.bfloat16)
+        scalar_physical_shape = torch.empty(8, 1, device="cuda", dtype=torch.bfloat16)
+
+        signatures = {
+            signature(contiguous, alignment_bytes=4),
+            signature(transposed, preserve_layout=True),
+            *(
+                signature(tensor)
+                for tensor in (
+                    contiguous,
+                    different_shape,
+                    different_dtype,
+                    scalar,
+                    scalar_physical_shape,
+                )
+            ),
+        }
+        self.assertEqual(len(signatures), 7)
+
+    def test_direct_epilogue_schema_separates_local_reduce_result(self):
+        from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
+            CuTeDSLEpilogueArguments,
+        )
+
+        args = CuTeDSLEpilogueArguments(
+            "def epilogue(accum, D):\n"
+            "    _local_reduce = accum\n"
+            "    return D, _local_reduce",
+            D=torch.empty(1),
+        )
+        schema = args.epilogue_fn.schema
+        self.assertEqual(schema.outputs, ("D",))
+        self.assertEqual(schema.parameter_names, ("D",))
+        self.assertTrue(schema.returns_local_reduce)
+
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     @parametrize(
         "layout_a,layout_b",
