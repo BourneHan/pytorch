@@ -87,6 +87,20 @@ def _create_tensor_with_layout(layout, rows, cols, dtype, device="cuda"):
         raise ValueError(f"Unknown layout: {layout}")
 
 
+def _make_nvfp4_scaled_mm_inputs(m, n, k):
+    packed_k = k // 2
+    a = _create_tensor_with_layout("contiguous", m, packed_k, torch.float4_e2m1fn_x2)
+    b = _create_tensor_with_layout("contiguous", n, packed_k, torch.float4_e2m1fn_x2).T
+    scale_k = _prep_k(k, 16)
+    scale_a = torch.rand(_round_up(m, 128) * scale_k, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    scale_b = torch.rand(_round_up(n, 128) * scale_k, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    return a, b, scale_a, scale_b
+
+
 def _nvgemm_config(**overrides):
     """Standard NVGEMM test config. Always disables ATen fallback."""
     cfg = {
@@ -925,7 +939,7 @@ class TestNVUniversalGemmHeuristics(TestCase):
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRExpression as Expr,
             GemmEpilogueIRStore,
-            grouped_reduction_ir,
+            grouped_reduction_pattern_ir,
         )
 
         load = Expr("load", ("gemm", 0, None))
@@ -933,12 +947,15 @@ class TestNVUniversalGemmHeuristics(TestCase):
         def classify(value):
             square = Expr("mul", (value, value))
             reduction = Expr("reduction", (torch.float32, torch.float32, "sum", square))
-            return grouped_reduction_ir(
+            return grouped_reduction_pattern_ir(
                 GemmEpilogueIRStore(0, reduction), "gemm", 4, torch.bfloat16
             )
 
         fp32 = Expr("to_dtype", (load, torch.float32))
-        self.assertEqual(classify(fp32), ("sum", "square"))
+        result = classify(fp32)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "sum")
+        self.assertEqual(result[1].op, "mul")
         fp16_then_fp32 = Expr(
             "to_dtype", (Expr("to_dtype", (load, torch.float16)), torch.float32)
         )
@@ -947,27 +964,20 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertIsNone(classify(Expr("to_dtype", (bitcast, torch.float32))))
 
     def test_grouped_reduction_ir_normalizes_loop_representation(self):
-        from torch._inductor.kernel.gemm_epilogue import GemmReductionConfig
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
-            GemmEpilogueIRAnalysis,
             GemmEpilogueIRExpression as Expr,
             GemmEpilogueIRStore,
+            grouped_reduction_pattern_ir,
         )
 
         load = Expr("load", ("gemm", 0, None))
         reduction = Expr("reduction", (torch.float32, torch.float32, "sum", load))
-        analysis = GemmEpilogueIRAnalysis({"out": GemmEpilogueIRStore(0, reduction)})
-
-        self.assertEqual(
-            analysis.grouped_reduction("out", "gemm", 4, 1, torch.float32),
-            GemmReductionConfig(
-                output_name="out",
-                group=4,
-                axis=1,
-                reduction_type="sum",
-                source_type="identity",
-            ),
+        pattern = grouped_reduction_pattern_ir(
+            GemmEpilogueIRStore(0, reduction), "gemm", 4, torch.float32
         )
+        self.assertIsNotNone(pattern)
+        self.assertEqual(pattern[0], "sum")
+        self.assertIs(pattern[1], load)
 
     @unittest.skipUnless(
         ensure_nv_universal_gemm_available(), "Requires cutlass.operators"
@@ -990,26 +1000,19 @@ class TestNVUniversalGemmHeuristics(TestCase):
             group=8,
             axis=1,
             reduction_type="sum",
-            source_type="square",
-            reduction_algorithm="variance",
+            source_fn="def source(value):\n    return value * value",
             feeds_main=True,
             finalizer_fn=("def finalize(value, group):\n    return value / group"),
         )
         config = GemmReductionCompileConfig.from_args(args, cute)
 
         self.assertEqual(
-            config.constexprs()[:5],
-            (8, 1, "sum", "variance", True),
+            config.constexprs()[:4],
+            (8, 1, True, False),
         )
-        self.assertNotIn("square", config.constexprs())
         self.assertEqual(config.reduction.source(3.0), 9.0)
         self.assertEqual(config.reduction.finalize(16.0, 8), 2.0)
-        self.assertTrue(
-            DENSE_GEMM_REDUCTION_CAPABILITIES.supports("sum", "square", "variance")
-        )
-        self.assertFalse(
-            DENSE_GEMM_REDUCTION_CAPABILITIES.supports("variance_affine:1:0", "square")
-        )
+        self.assertTrue(DENSE_GEMM_REDUCTION_CAPABILITIES.supports("sum"))
         secondary = dataclasses.replace(
             args,
             feeds_main=False,
@@ -1028,7 +1031,7 @@ class TestNVUniversalGemmHeuristics(TestCase):
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRExpression as Expr,
             GemmEpilogueIRStore,
-            grouped_reduction_ir,
+            grouped_reduction_pattern_ir,
         )
 
         summed = Expr(
@@ -1040,7 +1043,7 @@ class TestNVUniversalGemmHeuristics(TestCase):
             (torch.float32, torch.float32, "max", Expr("load", ("gemm", 0, None))),
         )
         store = GemmEpilogueIRStore(0, Expr("add", (summed, maximum)))
-        self.assertIsNone(grouped_reduction_ir(store, "gemm", 4, torch.float32))
+        self.assertIsNone(grouped_reduction_pattern_ir(store, "gemm", 4, torch.float32))
 
     def test_epilogue_ir_preserves_empty_tuple_argument(self):
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
@@ -1686,7 +1689,10 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertEqual(result[0], expected[0])
         self.assertEqual(result[1], expected[1])
         self.assertIn("output=", code)
-        self.assertIn("source_type='square'", code)
+        self.assertNotIn("_LOCAL_REDUCE_SOURCE_FN_SRC", code)
+        self.assertIn("reduction_type=None", code)
+        self.assertIn("source_fn=None", code)
+        self.assertIn(" * ", code)
 
     @config.patch(emulate_precision_casts=True)
     def test_scaled_mm_grouped_reduce_rejects_intermediate_fp16(self):
@@ -1749,12 +1755,73 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
                 out_dtype=torch.bfloat16,
             )
             grouped = result.float().view(-1, group, n)
-            mean = grouped.mean(1, keepdim=True).expand(-1, group, -1)
+            mean = (grouped.sum(1, keepdim=True) / group).expand(-1, group, -1)
             return result.float() - mean.reshape(m, n)
 
         result, code, _ = self._compile_and_check(fn, a, b, scale_a, scale_b)
         self.assertEqual(result, fn(a, b, scale_a, scale_b))
         self.assertIn("feeds_main=True", code)
+        self.assertNotIn("_LOCAL_REDUCE_CONSUMER_FINALIZER_FN_SRC", code)
+
+    def test_scaled_mm_grouped_reduce_raw_feed_and_finalized_output(self):
+        m, n, k, group = 128, 128, 512, 4
+        packed_k = k // 2
+        a = _create_tensor_with_layout(
+            "contiguous", m, packed_k, torch.float4_e2m1fn_x2
+        )
+        b = torch.randint(0, 256, (n, packed_k), device="cuda", dtype=torch.uint8).view(
+            torch.float4_e2m1fn_x2
+        )
+        b = b.T
+        padded_k_blocks = _round_up(ceildiv(k, 16), 4)
+        scale_a = torch.rand(_round_up(m, 128) * padded_k_blocks, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        scale_b = torch.rand(_round_up(n, 128) * padded_k_blocks, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+
+        def fn(a, b, scale_a, scale_b):
+            result = torch._scaled_mm(
+                a,
+                b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                out_dtype=torch.bfloat16,
+            )
+            grouped = result.float().view(-1, group, n)
+            sums = grouped.sum(1, keepdim=True)
+            means = sums / group
+            return result.float() - sums.expand(-1, group, -1).reshape(m, n), means
+
+        result, code, _ = self._compile_and_check(fn, a, b, scale_a, scale_b)
+        self.assertEqual(result, fn(a, b, scale_a, scale_b))
+        self.assertIn("feeds_main=True", code)
+        self.assertNotIn("_LOCAL_REDUCE_CONSUMER_FINALIZER_FN_SRC", code)
+        self.assertIn("_LOCAL_REDUCE_FINALIZER_FN_SRC", code)
+
+    def test_scaled_mm_grouped_n_mean_feeds_main_before_output_finalizer(self):
+        m, n, k, group = 128, 128, 512, 4
+        a, b, scale_a, scale_b = _make_nvfp4_scaled_mm_inputs(m, n, k)
+
+        def fn(a, b, scale_a, scale_b):
+            result = torch._scaled_mm(
+                a,
+                b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                out_dtype=torch.bfloat16,
+            )
+            grouped = result.float().view(m, -1, group)
+            means = grouped.square().mean(-1, keepdim=True)
+            roots = means.sqrt()
+            centered = (grouped - means).reshape(m, n)
+            return centered, roots
+
+        result, code, _ = self._compile_and_check(fn, a, b, scale_a, scale_b)
+        self.assertEqual(result, fn(a, b, scale_a, scale_b))
+        self.assertIn("_LOCAL_REDUCE_CONSUMER_FINALIZER_FN_SRC", code)
+        self.assertIn("_LOCAL_REDUCE_FINALIZER_FN_SRC", code)
 
     def test_matmul_add_relu_chained(self):
         """Multi-op pointwise chain (a@b + bias → relu) collapses to one

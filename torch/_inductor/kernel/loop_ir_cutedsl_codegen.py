@@ -20,6 +20,7 @@ from .gemm_epilogue import (
     GEMM_LOCAL_REDUCTION_RESULT_NAME,
     GemmEpiloguePlan,
     GemmReductionGeometry,
+    GemmReductionType,
 )
 from .gemm_epilogue_codegen import (
     canonical_tensorssa_reduction_type,
@@ -139,7 +140,7 @@ class LoopIRCuteDSLCodegen:
         )
         if region is None or len(region.reductions) != 1:
             raise NotImplementedError(
-                "physical CuTeDSL GEMM epilogues require one reduction"
+                "cross-fragment CuTeDSL GEMM epilogues require one reduction"
             )
         reduction = region.reductions[0]
         source = reduction.synthetic_element or reduction.source
@@ -416,15 +417,23 @@ class LoopIRCuteDSLCodegen:
         body.append(f"    return {result}")
         return f"def {fn_name}(value):\n" + "\n".join(body)
 
+    @staticmethod
+    def logical_reduction_finalizer(
+        reduction_type: GemmReductionType, fn_name: str
+    ) -> str | None:
+        if reduction_type != "mean":
+            return None
+        return f"def {fn_name}(value, group):\n    return value / group"
+
     @classmethod
-    def physical_reduction_callbacks(
+    def reduction_callbacks(
         cls,
         accumulator: str,
         analysis: GemmEpilogueIRAnalysis,
         output_name: str,
         geometry: GemmReductionGeometry,
     ) -> tuple[str, str]:
-        """Generate combine and finalizer callbacks for one physical reduction."""
+        """Generate combine and finalizer callbacks for one Loop IR reduction."""
         region = analysis.reduction_region(
             output_name,
             accumulator,
@@ -433,7 +442,7 @@ class LoopIRCuteDSLCodegen:
         )
         if region is None or len(region.reductions) != 1:
             raise NotImplementedError(
-                "physical CuTeDSL GEMM epilogues require one reduction"
+                "cross-fragment CuTeDSL GEMM epilogues require one reduction"
             )
         reduction = region.reductions[0]
         desc = tensorssa_reduction(
@@ -462,7 +471,7 @@ class LoopIRCuteDSLCodegen:
                 pending.extend(item for _, item in value.kwargs)
             if target is None:
                 raise NotImplementedError(
-                    "physical CuTeDSL GEMM epilogue reduction is missing"
+                    "cross-fragment CuTeDSL GEMM epilogue reduction is missing"
                 )
 
         codegen = cls(accumulator, OrderedSet((accumulator,)))
@@ -481,7 +490,7 @@ class LoopIRCuteDSLCodegen:
             result = codegen.lower(region.expression)
         if codegen.reads:
             raise NotImplementedError(
-                "physical reduction finalizer cannot capture tensor inputs"
+                "cross-fragment reduction finalizer cannot capture tensor inputs"
             )
         body = [*(f"    {line}" for line in codegen.kernel.body.lines)]
         body.append(f"    return {result}")
