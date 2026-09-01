@@ -5330,6 +5330,26 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         exit_stack.close()
 
+    def masked_store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        mask: CSEVariable,
+    ) -> None:
+        if not isinstance(value, TritonCSEVariable) or not isinstance(
+            mask, TritonCSEVariable
+        ):
+            raise AssertionError("TritonKernel expects TritonCSEVariable operands")
+        with self.mask_loads(
+            mask,
+            value=0,
+            redundant_masks=self._implied_range_masks(
+                getattr(V.interpreter, "current_node", None)
+            ),
+        ):
+            self.store(name, index, value)
+
     def device_assert_async(self, cond, msg) -> None:
         self.compute.writeline(f"tl.device_assert({cond}, {repr(msg)})")
 
@@ -8337,6 +8357,17 @@ class FusedUserDefinedTritonKernel(TritonKernel):
                 "Inductor indexing variables are not defined in user kernel scope. "
             )
 
+    def masked_store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        mask: CSEVariable,
+    ) -> None:
+        raise NotImplementedError(
+            "user-defined Triton kernels do not support masked stores"
+        )
+
     # returns a str which is the src code of a modified version of the user kernel that includes the epilogues
     def codegen(self) -> str:
         with self:
@@ -8413,6 +8444,7 @@ class TritonScheduling(SIMDScheduling):
             BackendFeature.BUCKETIZE,
             BackendFeature.INPLACE_BUFFERS,
             BackendFeature.MASKED_SCATTER_WITH_INDEX,
+            BackendFeature.MASKED_STORE,
             BackendFeature.SCAN,
             BackendFeature.SORT,
             BackendFeature.TRITON_TEMPLATES,
