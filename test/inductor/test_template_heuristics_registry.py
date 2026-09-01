@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+import subprocess
+import sys
+import textwrap
+
 import torch
 from torch._inductor.heuristics.registry import (
     _TEMPLATE_HEURISTIC_REGISTRY,
@@ -13,6 +17,80 @@ from torch._inductor.heuristics.template.triton import (
     FlexConfig,
 )
 from torch._inductor.test_case import run_tests, TestCase
+
+
+# Frozen at the #183275 re-land (1374acc2890): the submodules that existed under
+# torch._inductor.template_heuristics when the move landed. Modules added to
+# heuristics/template/ afterwards (e.g. flydsl) never had an old import path, so
+# aliasing them would create a backward-compatibility obligation that never existed.
+_HISTORICAL_SUBMODULES = (
+    "aten",
+    "base",
+    "contiguous_mm",
+    "cutedsl",
+    "decompose_k",
+    "flex_gemm",
+    "gemm",
+    "nv_universal_gemm",
+    "params",
+    "registry",
+    "tlx",
+    "triton",
+    "triton_addmm",
+)
+
+
+class TestTemplateHeuristicsCompatibility(TestCase):
+    def test_historical_import_paths(self):
+        # Runs in a subprocess because this module already imports
+        # torch._inductor.heuristics.template, and only a cold interpreter
+        # reaches the canonical package through the compatibility shim.
+        source = textwrap.dedent(
+            f"""
+            import importlib
+
+            historical = importlib.import_module("torch._inductor.template_heuristics")
+
+            for name in {_HISTORICAL_SUBMODULES!r}:
+                historical_module = importlib.import_module(
+                    f"torch._inductor.template_heuristics.{{name}}"
+                )
+                canonical_module = importlib.import_module(
+                    f"torch._inductor.heuristics.template.{{name}}"
+                )
+                if historical_module is not canonical_module:
+                    raise AssertionError(
+                        f"module identity mismatch for {{name}}: "
+                        f"{{historical_module!r}} is not {{canonical_module!r}}"
+                    )
+                if getattr(historical, name) is not canonical_module:
+                    raise AssertionError(
+                        f"package attribute mismatch for {{name}}: "
+                        f"{{getattr(historical, name)!r}} is not {{canonical_module!r}}"
+                    )
+
+            canonical_registry = importlib.import_module(
+                "torch._inductor.heuristics.template.registry"
+            )
+            if (
+                historical.get_template_heuristic
+                is not canonical_registry.get_template_heuristic
+            ):
+                raise AssertionError("get_template_heuristic identity mismatch")
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", source],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
 
 class TestBlackwellGPUGemmConfig(TestCase):
