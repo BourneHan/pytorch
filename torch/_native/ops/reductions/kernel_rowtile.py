@@ -286,6 +286,40 @@ _ITREE_VEC_MUL = 1
 # band and extrapolating is exactly the mistake this comment exists to record.
 _ITREE_BLOCK_THREADS = 256
 
+# SMEM-STAGED FOLD, on for NARROW per-lane runs. See tile.TileReduce._fold_itree_smem.
+#
+# The butterfly count is span/(WARP*vec) -- one per 32-lane load -- because a coalesced load leaves
+# a lane owning only `vec` adjacent columns, and in-register tree levels need an ALIGNED CONTIGUOUS
+# run. Staging breaks the tie: the global read stays coalesced, the lane reads its own contiguous
+# run back out of smem, and one butterfly replaces all of them. Bit-neutral (verified: 32 wide
+# lanes plus one butterfly == ATen's per-chunk nesting).
+#
+# SHIPPING CONFIGURATION: cp.async, one batch, covered in TILES of `_ITREE_STAGE_E * WARP` columns.
+# MEASURED device us, chunk fusion -> tiled staging, and the result against the unordered rolled
+# fold (the number the order is trying not to lose to):
+#
+#   (  65536,   1024)  48.2 -> 40.9 us   1.06x of the rolled fold
+#   (  32768,   2048)  47.6 -> 38.6      0.97x -- FASTER than the rolled fold
+#   (  16384,   4096)  48.9 -> 39.2      1.03x
+#   (   8192,   8192)  48.7 -> 39.6      1.03x
+#
+# so the mid-band's 1.28x deficit against the rolled fold is gone.
+#
+# Three alternatives were measured and lost, each for a different reason -- kept as one-liners
+# because the reasons still constrain the design:
+#   staging via REGISTERS (global -> reg -> smem): costs more than the shuffles it saves (53.2 us
+#     at N=1024 against 40.7 for cp.async), which is why the gate requires the cp.async path.
+#   staging the WHOLE batch: smem/row becomes the batch (33 KB at N=8192), capping occupancy and
+#     losing to chunk fusion above E=32 -- the reason for tiling rather than one big buffer.
+#   PACKING ROWS per block on top of staging: 45.5 vs 40.7 at N=1024, same cause (smem capacity
+#     caps occupancy).
+# A run SHORTER than the sweet spot is also bad (74.0 vs 51.3 at span=512, where E is forced to
+# 16), hence the gate on the full per-lane run.
+
+# Columns per lane PER TILE. 32 is where the untiled sweep bottomed out (40.7us at N=1024); tiling
+# holds every wider batch at that same per-lane run and the same 4.6 KB of smem per row.
+_ITREE_STAGE_E = 32
+
 
 def inner_tree_order_enabled() -> bool:
     """Is the reproducible-DAG order requested? Read live, so tests can toggle it."""
@@ -328,6 +362,9 @@ class _ItreePlan(NamedTuple):
     kchunk: int = 1
     # Fold a thread's run as one LINEAR chain instead of a tree. DOES change the DAG.
     vec_linear: bool = False
+    # SMEM-STAGED fold: columns per lane, so one warp folds the batch with ONE butterfly. 0 = off.
+    # Bit-neutral (32 wide contiguous lanes + one butterfly == ATen's per-chunk nesting).
+    stage_e: int = 0
 
     @property
     def sig(self):
@@ -342,6 +379,7 @@ class _ItreePlan(NamedTuple):
             self.split,
             self.kchunk,
             self.vec_linear,
+            self.stage_e,
         )
 
 
@@ -367,6 +405,7 @@ def itree_plan(
     kchunk: int | None = None,
     vmul: int | None = None,
     vec_linear: bool = False,
+    stage: bool | None = None,
 ):
     """The order's plan for this shape, or None when it does not apply.
 
@@ -464,11 +503,44 @@ def itree_plan(
     )
     k = _fuse_factor(kc, wpr, vec, prm.effective_loads)
     rpb = max(1, min(M, _ITREE_BLOCK_THREADS // max(1, WARP * (wpr // k))))
-    # SMEM STAGING serves the SINGLE-BATCH shapes only for now: one warp per row, E = span/WARP
-    # columns per lane. Needs the batch to cover the row (so `hi` is one compile-time bound) and
-    # E within the unroll ceiling.
-    # Only worth staging when it actually REMOVES butterflies: at span == wle there is already
-    # just one, so staging would buy nothing and still pay the smem round trip.
+    # SMEM STAGING serves the SINGLE-BATCH shapes only for now, so the batch covers the row and
+    # `hi` is one compile-time bound.
+    span = wpr * prm.effective_loads * WARP * vec
+    # `stage_e` is the per-lane run PER TILE, so smem stays at (stage_e + vec) * WARP per row no
+    # matter how wide the batch is; the batch is covered in span/(stage_e*WARP) tiles, each ending
+    # in one butterfly. Capped at the measured sweet spot rather than span/WARP.
+    e = min(span // WARP, _ITREE_STAGE_E)
+    while e > vec and (span // (e * WARP)) * e * WARP != span:
+        e //= 2
+    # Stage when the FULL per-lane run is achievable (a shorter one measured badly: 74.0 vs 51.3 at
+    # span=512, E=16) AND there is more than one butterfly to remove -- at span == wle there is
+    # already just one, so staging would buy nothing and still pay the smem round trip.
+    want_stage = (e == _ITREE_STAGE_E and span > WARP * vec) if stage is None else stage
+    if (
+        want_stage
+        and prm.num_batches == 1
+        and not vec_linear
+        # cp.async's 128-bit atom needs a statically 16-byte-aligned source, and the input wrap
+        # can only declare that when vec divides N (align_bytes is gcd-based). A ragged row keeps
+        # the register fold rather than silently narrowing the copy.
+        and N % vec == 0
+        and e % vec == 0
+        and e <= tile.MAX_UNROLL
+        and (e // vec) & (e // vec - 1) == 0
+    ):
+        return _ItreePlan(
+            "looped",
+            vec,
+            wpr,
+            min(M, prm.rows_per_block) or 1,
+            prm.depth,
+            tuple(batches),
+            tms,
+            (),
+            1,
+            False,
+            e,
+        )
     return _ItreePlan(
         "looped",
         vec,
