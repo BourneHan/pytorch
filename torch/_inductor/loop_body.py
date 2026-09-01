@@ -342,8 +342,10 @@ class LoopBody:
         expand_dimension_for_pointwise_node, this does not wrap the expanded
         dimension in `Mod`, so loads, index_exprs and bounds checks all evaluate
         at the raw expanded coordinate; only the writes are masked. The caller
-        must prove the added tail addresses are live and reject bodies containing
-        MASKED_EXPANSION_BANNED_OPS.
+        must prove the added tail addresses are live (see
+        `_try_masked_reindex_reduction_consumer`, which requires every read to
+        match an access already made by the reduction) and must reject bodies
+        containing MASKED_EXPANSION_BANNED_OPS.
         """
         if V.graph.sizevars.statically_known_equals(
             self.sizes[0][dimension], new_range

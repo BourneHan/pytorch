@@ -70,7 +70,7 @@ from .ir import (
     MultiOutputLayout,
     NoneLayout,
 )
-from .loop_body import LoopBody
+from .loop_body import LoopBody, MASKED_EXPANSION_BANNED_OPS
 from .memory import MemoryPlanningInfoForBuffer, MemoryPlanningInfoForNode
 from .runtime.hints import DeviceProperties, ReductionHint
 from .runtime.runtime_utils import green_text, is_power_of_2, red_text
@@ -2534,6 +2534,9 @@ class BaseSchedulerNode:
         typing.cast(Any, self.get_tiling).clear_cache(self)
         self.read_write_deps.clear_cache(self)
         self.read_size_by_name.clear_cache(self)
+        typing.cast(Any, self.get_read_write_buffers_sizes).clear_cache(self)
+        typing.cast(Any, self.get_read_buffer_sizes).clear_cache(self)
+        typing.cast(Any, self.get_write_buffer_sizes).clear_cache(self)
 
     @cache_on_self
     def get_coalesce_analysis(self) -> CoalesceVarAnalysis | None:
@@ -3645,15 +3648,36 @@ class SchedulerNode(BaseSchedulerNode):
     def expand_dimension_for_pointwise_node(
         self, dimension: int, new_range: int
     ) -> None:
+        self._expand_dimension_for_pointwise_node(
+            dimension, new_range, mask_stores=False
+        )
+
+    def expand_dimension_for_pointwise_node_with_masked_stores(
+        self, dimension: int, new_range: int
+    ) -> None:
+        self._expand_dimension_for_pointwise_node(
+            dimension, new_range, mask_stores=True
+        )
+
+    def _expand_dimension_for_pointwise_node(
+        self, dimension: int, new_range: int, *, mask_stores: bool
+    ) -> None:
         if not isinstance(self.node, (ir.ComputedBuffer, ir.TemplateBuffer)):
             raise AssertionError(
                 "expected self.node to be a ComputedBuffer or TemplateBuffer"
             )
 
         self._before_loop_state_mutation()
-        self._body = self._body.expand_dimension_for_pointwise_node(
-            dimension, new_range
-        )
+        if mask_stores:
+            self._body = (
+                self._body.expand_dimension_for_pointwise_node_with_masked_stores(
+                    dimension, new_range
+                )
+            )
+        else:
+            self._body = self._body.expand_dimension_for_pointwise_node(
+                dimension, new_range
+            )
         self._sizes = self._body.sizes
 
         device = self.node.get_device_or_error()
@@ -6633,6 +6657,17 @@ class Scheduler:
                     break
 
             if (
+                config.loop_reindexing_after_fusion
+                and config.masked_expansion_max_ratio > 0
+                and not config.benchmark_fusion
+            ):
+                fused_nodes = OrderedSet(nodes)
+                if self._fuse_near_sized_reduction_epilogues(fused_nodes):
+                    nodes = self.topological_sort_schedule(
+                        sorted(fused_nodes, key=lambda node: node.min_order)
+                    )
+
+            if (
                 config.loop_ordering_after_fusion
                 or config.loop_index_inversion_in_fusion
             ):
@@ -9277,6 +9312,175 @@ class Scheduler:
                 refresh_group_node_dependencies(pw_node)
 
         return True
+
+    def _try_masked_reindex_reduction_consumer(
+        self,
+        reduction: BaseSchedulerNode,
+        consumer: SchedulerNode,
+    ) -> bool:
+        """Expand one static pointwise consumer to a near-sized reduction."""
+        from .codegen.simd import SIMDKernel
+
+        if (
+            not isinstance(reduction, (SchedulerNode, FusedSchedulerNode))
+            or isinstance(
+                reduction,
+                (FusedMixOrderReductions, FusedNestedReductions, FusedStagedReduction),
+            )
+            or reduction.is_template()
+            or consumer.is_reduction()
+            or reduction.is_cpu()
+            or consumer.has_aliasing_or_mutation()
+            or not isinstance(consumer.node, ComputedBuffer)
+            or not isinstance(consumer.node.data, Pointwise)
+            or not isinstance(consumer._body, LoopBody)
+            or not V.graph.has_feature(
+                consumer.get_device(), BackendFeature.MASKED_STORE
+            )
+        ):
+            return False
+
+        body = consumer._body
+        if any(
+            body.has_op(op) for op in (*MASKED_EXPANSION_BANNED_OPS, "masked_store")
+        ) or any(
+            isinstance(dep, MemoryDep) and dep.mode is not None
+            for dep in consumer.read_writes.writes
+        ):
+            return False
+
+        _, (red_numel, red_rnumel) = reduction.group
+        pw_numel = sympy_product(consumer._sizes[0])
+        target_numel = red_numel * red_rnumel
+        if not V.graph.sizevars.statically_known_gt(red_numel, 0):
+            return False
+        pw_rnumel = FloorDiv(pw_numel, red_numel)
+        max_ratio = config.masked_expansion_max_ratio
+        if max_ratio <= 0 or not math.isfinite(max_ratio):
+            return False
+        max_target_ratio = sympy.Rational(1 + max_ratio).limit_denominator(10**6)
+        if (
+            not V.graph.sizevars.statically_known_equals(
+                red_numel * pw_rnumel, pw_numel
+            )
+            or not V.graph.sizevars.statically_known_lt(pw_rnumel, red_rnumel)
+            or not V.graph.sizevars.statically_known_leq(
+                target_numel, pw_numel * max_target_ratio
+            )
+        ):
+            return False
+
+        if not SIMDKernel.is_compatible((red_numel, pw_rnumel), consumer.get_ranges()):
+            return False
+
+        pw_numel_hint = V.graph.sizevars.optimization_hint(pw_numel, fallback=0)
+        target_numel_hint = V.graph.sizevars.optimization_hint(target_numel, fallback=0)
+        pw_access_bytes = consumer.get_read_write_buffers_sizes()
+        if (
+            not pw_numel_hint
+            or target_numel_hint <= pw_numel_hint
+            or not pw_access_bytes
+        ):
+            return False
+        expansion_bytes = (
+            pw_access_bytes * (target_numel_hint - pw_numel_hint) + pw_numel_hint - 1
+        ) // pw_numel_hint
+
+        iter_sizes = tuple(consumer._sizes[0])
+        if (
+            iter_sizes
+            and V.graph.sizevars.statically_known_equals(iter_sizes[-1], pw_rnumel)
+            and V.graph.sizevars.statically_known_equals(
+                sympy_product(iter_sizes[:-1]), red_numel
+            )
+        ):
+            expand_dim = len(iter_sizes) - 1
+        else:
+            return False
+        consumer.expand_dimension_for_pointwise_node_with_masked_stores(
+            expand_dim, red_rnumel
+        )
+
+        root_load_names: OrderedSet[str] = OrderedSet()
+        for body_node in consumer._body.root_block.graph.nodes:
+            if body_node.op == "call_method" and body_node.target == "load":
+                name = body_node.kwargs.get(
+                    "name", body_node.args[1] if len(body_node.args) >= 2 else ""
+                )
+                root_load_names.add(consumer.mutation_renames.get(name, name))
+
+        reduction_deps: dict[str, list[Dep]] = defaultdict(list)
+        for dep in reduction.read_writes.reads_and_writes():
+            reduction_deps[dep.name].append(dep)
+        reduction_writes: dict[str, list[Dep]] = defaultdict(list)
+        for dep in reduction.read_writes.writes:
+            reduction_writes[dep.name].append(dep)
+        for read in consumer.read_writes.reads:
+            if read.name in root_load_names and not any(
+                self.deps_match_normalized(read, write)
+                for write in reduction_writes[read.name]
+            ):
+                return False
+
+        matched_reads = [
+            read
+            for read in consumer.read_writes.reads
+            if any(
+                self.deps_match_normalized(read, reduction_dep)
+                for reduction_dep in reduction_deps[read.name]
+            )
+        ]
+        shared_bytes = sum(self.dep_size_hint(read) for read in matched_reads)
+        return (
+            expansion_bytes * config.masked_expansion_shared_bytes_multiple
+            <= shared_bytes
+        )
+
+    def _fuse_near_sized_reduction_epilogues(
+        self, fused_nodes: OrderedSet[BaseSchedulerNode]
+    ) -> bool:
+        did_fuse = False
+        candidates: list[tuple[BaseSchedulerNode, BaseSchedulerNode]] = []
+        for reduction in fused_nodes:
+            if not reduction.is_reduction():
+                continue
+            reduction_nodes = OrderedSet(reduction.get_nodes())
+            users = OrderedSet(
+                use.node
+                for output in reduction.get_outputs()
+                for use in output.users
+                if not use.is_weak
+                and isinstance(use.node, SchedulerNode)
+                and use.node not in reduction_nodes
+            )
+            if len(users) == 1:
+                candidates.append((reduction, users.pop()))
+
+        candidates.sort(key=self.score_fusion_key, reverse=True)
+        for reduction, consumer in candidates:
+            if (
+                reduction not in fused_nodes
+                or consumer not in fused_nodes
+                or self.will_fusion_create_cycle(reduction, consumer)
+            ):
+                continue
+            snapshot = _LoopStateSnapshot.create((consumer,))
+            fused = False
+            try:
+                if not self._try_masked_reindex_reduction_consumer(
+                    reduction,
+                    typing.cast(SchedulerNode, consumer),
+                ):
+                    continue
+                if not self.can_fuse(reduction, consumer, can_reorder=True):
+                    continue
+                self.fuse_two_nodes(reduction, consumer, fused_nodes)
+                fused = True
+                did_fuse = True
+            finally:
+                if not fused:
+                    snapshot.restore()
+        return did_fuse
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
