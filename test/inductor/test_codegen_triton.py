@@ -6,7 +6,7 @@ import unittest
 from collections import namedtuple, OrderedDict
 from enum import Enum, IntEnum
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import sympy
 
@@ -41,6 +41,10 @@ from torch._inductor.utils import (
     run_and_get_kernels,
 )
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
     HAS_CPU,
@@ -79,6 +83,7 @@ except ImportError:
     )
 
 
+@instantiate_parametrized_tests
 class TestCodegenTriton(InductorTestCase):
     def setUp(self):
         super().setUp()
@@ -137,6 +142,58 @@ class TestCodegenTriton(InductorTestCase):
         self.assertTrue(torch.isnan(actual_min[2]).item())
         self.assertTrue(torch.isnan(actual_max[2]).item())
         self.assertIn("tl.where", " ".join(code))
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_cat_upper_bounds_replace_reduction_mask(self):
+        def fn(a, b, c):
+            return torch.cat((a, b, c), dim=-1).amax(dim=-1)
+
+        shapes = ((8, 32, 1), (8, 32, 31), (8, 32, 1))
+        args = [
+            torch.randn(shape, device=GPU_TYPE, dtype=torch.bfloat16)
+            for shape in shapes
+        ]
+        actual, code = run_and_get_code(torch.compile(fn, fullgraph=True), *args)
+
+        self.assertEqual(actual, fn(*args))
+        loads = [
+            line
+            for source in code
+            for line in source.splitlines()
+            if "tl.load(in_ptr" in line
+        ]
+        self.assertEqual(len(loads), 3)
+        self.assertNotIn("r0_mask", loads[0])
+        self.assertNotIn("r0_mask", loads[1])
+        self.assertIn("r0_mask", loads[2])
+
+    @parametrize("upper,expected", [(8, {"xmask"}), (9, set()), (-1, set())])
+    def test_implied_range_masks_fail_closed(self, upper, expected):
+        kernel = TritonKernel(
+            {"x": 8},
+            features=SIMDKernelFeatures([], 8, sympy.S.One),
+            override_persistent_reduction=False,
+            override_cooperative_reduction=False,
+        )
+        with kernel:
+            source = kernel.range_trees[0].full_range().symbol()
+            graph = torch.fx.Graph()
+            ops_node = graph.placeholder("ops")
+            index = graph.call_module("get_index", ("index0",))
+            lhs = graph.call_method("value_expr", (ops_node, index, torch.int64))
+            rhs = graph.call_method("constant", (ops_node, upper, torch.int64))
+            mask = graph.call_method("lt", (ops_node, lhs, rhs))
+            current = graph.call_module("masked_subblock0", (mask, 0.0))
+            interpreter = SimpleNamespace(
+                current_node=current, submodules={"get_index": lambda _: source}
+            )
+
+            with V.set_interpreter_handler(interpreter):
+                self.assertEqual(
+                    set(kernel._implied_range_masks(interpreter.current_node)), expected
+                )
+                interpreter.current_node = None
+                self.assertEqual(kernel._implied_range_masks(None), set())
 
     def test_range_tree_entry_ownership_uses_root_identity(self):
         class AlternateR0Root(IterationRangesRoot):

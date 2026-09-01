@@ -14,7 +14,7 @@ import operator
 import os
 import textwrap
 from abc import abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from functools import lru_cache
 from typing import Any, cast, TYPE_CHECKING, TypeVar
 
@@ -97,7 +97,7 @@ from ..utils import (
     triton_version_uses_attrs_dict,
     upcast_compute_type,
 )
-from ..virtualized import _ops as ops, ReductionType, StoreMode, V
+from ..virtualized import _ops as ops, OpsWrapper, ReductionType, StoreMode, V
 from ..wrapper_benchmark import get_kernel_category_by_source_code
 from .block_analysis import BlockPatternMatcher
 from .common import (
@@ -2591,7 +2591,13 @@ class TritonKernelOverrides(TritonOverrides):
 
         value = None if need_where else other
 
-        with V.kernel.mask_loads(mask, value=value) as new_mask:
+        with V.kernel.mask_loads(
+            mask,
+            value=value,
+            redundant_masks=V.kernel._implied_range_masks(
+                getattr(V.interpreter, "current_node", None)
+            ),
+        ) as new_mask:
             result = body()
 
         if need_where:
@@ -3362,6 +3368,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._op_trace_cse_names: dict[str, str] = {}
         self._op_trace_symbol_names: dict[sympy.Symbol, sympy.Symbol] = {}
         self._op_trace_symbol_counts: collections.Counter[str] = collections.Counter()
+        self._redundant_load_masks: OrderedSet[str] = OrderedSet()
 
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
@@ -3392,6 +3399,86 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def triton_tensor_ndim(self) -> int:
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
+
+    def _implied_range_masks(self, node: Any) -> OrderedSet[str]:
+        if not isinstance(node, torch.fx.Node):
+            return OrderedSet()
+        if node.op == "call_module":
+            if (
+                not str(node.target).startswith("masked_subblock")
+                or len(node.args) != 2
+            ):
+                return OrderedSet()
+            return self._implied_range_masks(node.args[0])
+        if node.op == "call_method" and node.target == "masked_store":
+            if len(node.args) != 5:
+                return OrderedSet()
+            return self._implied_range_masks(node.args[4])
+        if node.op == "call_method" and node.target in ("logical_and", "and_"):
+            result = OrderedSet[str]()
+            for arg in node.args[1:]:
+                result.update(self._implied_range_masks(arg))
+            return result
+        if node.op != "call_method" or node.target != "lt" or len(node.args) != 3:
+            return OrderedSet()
+
+        lhs, rhs = node.args[1:]
+        if (
+            not isinstance(lhs, torch.fx.Node)
+            or lhs.op != "call_method"
+            or lhs.target not in ("index_expr", "value_expr")
+            or len(lhs.args) != 3
+            or lhs.args[2] is not torch.int64
+            or not isinstance(rhs, torch.fx.Node)
+            or rhs.op != "call_method"
+            or rhs.target != "constant"
+            or len(rhs.args) != 3
+            or rhs.args[2] is not torch.int64
+        ):
+            return OrderedSet()
+        source = lhs.args[1]
+        upper = rhs.args[1]
+        if (
+            not isinstance(source, torch.fx.Node)
+            or source.op != "call_module"
+            or source.target != "get_index"
+            or not isinstance(upper, int)
+            or isinstance(upper, bool)
+            or not 0 <= upper <= torch.iinfo(torch.int64).max
+        ):
+            return OrderedSet()
+        get_index = getattr(V.interpreter, "submodules", {}).get(source.target)
+        if get_index is None:
+            return OrderedSet()
+        index = get_index(*source.args)
+        if not isinstance(index, sympy.Symbol):
+            return OrderedSet()
+        entry = self.range_tree_nodes.get(index)
+        if (
+            entry is None
+            or not V.graph.sizevars.statically_known_equals(entry.divisor, sympy.S.One)
+            or not V.graph.sizevars.statically_known_equals(
+                entry.length, entry.root.numel
+            )
+            or not V.graph.sizevars.statically_known_leq(upper, entry.root.numel)
+        ):
+            return OrderedSet()
+        return OrderedSet([entry.root.mask_name()])
+
+    @contextlib.contextmanager
+    def mask_loads(
+        self,
+        mask: str | OpsWrapper | TritonCSEVariable,
+        value: int | float,
+        redundant_masks: OrderedSet[str] | None = None,
+    ) -> Iterator[Any]:
+        prior = self._redundant_load_masks
+        self._redundant_load_masks = prior | (redundant_masks or OrderedSet())
+        try:
+            with super().mask_loads(mask, value) as new_mask:
+                yield new_mask
+        finally:
+            self._redundant_load_masks = prior
 
     def indexing_size_str(self, i: int) -> str:
         sizes = ["None"] * self.triton_tensor_ndim()
@@ -8008,12 +8095,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             raise AssertionError(f"expected xtree prefix 'x', got {xtree.prefix!r}")
         return self._has_constant_mask(xtree)
 
-    def filter_masks(self, mask_vars: OrderedSet[str]) -> None:
+    def filter_masks(self, mask_vars: OrderedSet[Any]) -> None:
         for tree in self.range_trees:
             if self._has_constant_mask(tree):
                 mask_vars.discard(tree.mask_name())
 
         mask_vars.discard("None")
+        mask_vars.difference_update(self._redundant_load_masks)
 
     @cache_on_self
     def get_reduction_prefixes(self) -> list[str]:
