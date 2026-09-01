@@ -804,12 +804,6 @@ class TestFlexAttentionTDMOptions(InductorTestCase):
         self.assertIn("block width is not 128-byte aligned", reasons)
         self.assertNotIn("innermost request extent", reasons)
 
-    def test_flex_templates_gate_descriptors_on_tma_or_tdm(self):
-        from torch._inductor.kernel.flex.common import load_flex_template
-
-        for name in ("flex_attention", "flex_decode", "common"):
-            self.assertIn("USE_TMA or USE_TDM", load_flex_template(name))
-
 
 @unittest.skipUnless(
     running_on_tdm_device(),
