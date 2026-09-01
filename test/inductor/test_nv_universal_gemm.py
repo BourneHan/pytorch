@@ -1334,6 +1334,7 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
             return torch.relu(result), result + 1.0
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
+        self.assertIn("CuTeDSLEpilogueArguments", code)
         self.assertEqual(result, fn(a, b), atol=1e-2, rtol=1e-2)
         self.assertTrue(epilogue_fused)
         self.assertIn("out_ptr1", code)

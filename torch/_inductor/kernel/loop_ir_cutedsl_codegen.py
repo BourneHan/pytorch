@@ -338,7 +338,7 @@ class LoopIRCuteDSLCodegen:
         )
         return GemmEpiloguePlan(
             source=source,
-            is_cutedsl=True,
+            is_evt_fallback=False,
             reads=tuple(self.reads),
             writes=tuple(name for name, _ in outputs),
             renames=renames,
