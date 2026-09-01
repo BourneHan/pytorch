@@ -518,8 +518,8 @@ def add(x, y):
         self._save_and_reload(expected_backends=2, expected_dynamo=2)
 
         # These should exist because of populate_caches
-        package1 = DynamoCache.load_and_install_package(fn)
-        package2 = DynamoCache.load_and_install_package(fn2)
+        package1 = DynamoCache.load_and_install_package(fn, -1)
+        package2 = DynamoCache.load_and_install_package(fn2, -1)
 
         with torch.compiler.set_stance("fail_on_recompile"):
             result1 = compiled_fn1(arg1)
@@ -554,6 +554,97 @@ def add(x, y):
 
         torch._dynamo.reset()
         self.assertEqual(len(_debug_get_precompile_entries(fn.__code__)), 0)
+
+    def test_abandoned_package_uninstalls_on_gc(self):
+        # A package that dies while installed must not strand its precompile
+        # entries and uuid-named resume globals on the process: each
+        # load+install of one artifact used to add a fresh owner's entries and
+        # +2 resume globals, forever. The finalizer must also leave alone a
+        # global a LATER package overwrote (same artifact, same names).
+        from torch._C._dynamo.eval_frame import _debug_get_precompile_entries
+
+        ctx = DiskDynamoStore()
+
+        def fn(x):
+            y = x.sin()
+            torch._dynamo.graph_break()
+            return y + x.cos()
+
+        def guard_filter_fn(guards):
+            # A nested fn with a graph break produces guards that cannot be
+            # serialized.
+            unserializable = ("MODULE_MATCH", "CLOSURE_MATCH", "FUNCTION_MATCH")
+            return [guard.guard_type not in unserializable for guard in guards]
+
+        package = CompilePackage(fn)
+        compiled_fn = torch._dynamo.optimize(
+            backend="eager", package=package, guard_filter_fn=guard_filter_fn
+        )(fn)
+        compiled_fn(torch.randn(3, 2))
+        for backend_id, bknd in package.cached_backends.items():
+            ctx.record_eager_backend(backend_id, bknd)
+        ctx.save_package(package, self.path())
+        torch._dynamo.reset()
+        del package, compiled_fn
+        gc.collect()
+
+        module_keys = set(sys.modules[fn.__module__].__dict__)
+        counts = []
+        for _ in range(4):
+            pkg, backends = ctx.load_package(fn, self.path())
+            pkg.install(backends)
+            counts.append(len(_debug_get_precompile_entries(fn.__code__)))
+            del pkg, backends
+            gc.collect()
+        # Each reload sees only its own entries (no growth across the four
+        # generations), the last dead owner's entries are gone, and nothing
+        # the dead packages installed is left in the module globals -- the
+        # shared builtins dict is deliberately left in place.
+        self.assertGreater(counts[0], 0)
+        self.assertEqual(counts, [counts[0]] * 4)
+        self.assertEqual(len(_debug_get_precompile_entries(fn.__code__)), 0)
+        leaked = set(sys.modules[fn.__module__].__dict__) - module_keys
+        self.assertTrue(all(k.startswith("__builtins_dict") for k in leaked), leaked)
+
+        # A LIVE package is untouched by garbage collection.
+        pkg, backends = ctx.load_package(fn, self.path())
+        pkg.install(backends)
+        gc.collect()
+        self.assertEqual(len(_debug_get_precompile_entries(fn.__code__)), counts[0])
+        pkg.uninstall()
+
+    @parametrize("device", ("cpu", "cuda", "xpu"))
+    @parametrize("isolate_recompiles", (False, True))
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_automatic_dynamo_serves_an_isolate_recompiles_context(
+        self, device, isolate_recompiles
+    ):
+        # The transparent cache installs the package it loads, and precompile
+        # entries match their own region only, so installing into the default
+        # bucket while the context looks up in its own region loaded the
+        # artifact and then served nothing -- every call recompiled, and under
+        # fail_on_recompile it raised. Nothing combined these two before.
+        def fn(x):
+            return x.sin() + x.cos()
+
+        if device == "cuda" and not HAS_CUDA_AND_TRITON:
+            raise unittest.SkipTest("Requires CUDA/Triton")
+        if device == "xpu" and not HAS_XPU_AND_TRITON:
+            raise unittest.SkipTest("Requires XPU/Triton")
+
+        arg = torch.randn(3, 2, device=device)
+        expected = fn(arg)
+        torch.compile(  # noqa: UNSPECIFIED_BACKEND
+            fn, isolate_recompiles=isolate_recompiles
+        )(arg)
+        DynamoCache.clear()
+        self._save_and_reload(expected_backends=1, expected_dynamo=1)
+
+        warm = torch.compile(  # noqa: UNSPECIFIED_BACKEND
+            fn, isolate_recompiles=isolate_recompiles
+        )
+        with torch.compiler.set_stance("fail_on_recompile"):
+            self.assertEqual(warm(arg), expected)
 
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
