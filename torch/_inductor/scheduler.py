@@ -27,7 +27,7 @@ from .ir import ComputedBuffer, Pointwise
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
     from types import ModuleType
 
     from torch._inductor.codegen.wrapper import EnterCudaStreamContextLine
@@ -8529,18 +8529,32 @@ class Scheduler:
                 pw_access_bytes * extra_numel + pw_numel_hint - 1
             ) // pw_numel_hint
 
-        if not all(
-            SIMDKernel.is_compatible((red_numel, pw_rnumel), sn.get_ranges())
-            for sn in snodes
-        ):
-            return False
-
+        target_iter_sizes = (red_numel, pw_rnumel)
         # Nothing to reindex if the pointwise already uses the reduction split.
-        target_iter_sizes = (red_numel, red_rnumel)
         if not needs_expansion and all(
             tuple(sn._sizes[0]) == target_iter_sizes for sn in snodes
         ):
             return False
+
+        broadcast_orders = None
+        # Reorder broadcasts only when normal reindexing fails.
+        if not all(
+            SIMDKernel.is_compatible(target_iter_sizes, sn.get_ranges())
+            for sn in snodes
+        ):
+            if needs_expansion or not config.loop_ordering_after_fusion:
+                return False
+            broadcast_orders = self._find_reduction_broadcast_orders(
+                reduction_node.get_buffer_names(), snodes, red_numel
+            )
+            if broadcast_orders is None or not all(
+                SIMDKernel.is_compatible(
+                    target_iter_sizes,
+                    (ir.same_reorder(order)(sn._sizes[0]), sn._sizes[1]),
+                )
+                for sn, order in zip(snodes, broadcast_orders, strict=True)
+            ):
+                return False
 
         # Measure each node's memory access before mutating any loops, so the
         # coalescing guard below can compare against the un-reindexed kernels.
@@ -8554,6 +8568,11 @@ class Scheduler:
         # failed reindex attempt returns -1 and the caller may keep evaluating
         # fusion within the same can_fuse() call.
         rollback_snapshot = _LoopStateSnapshot.create((pw_node,))
+
+        if broadcast_orders is not None:
+            for sn, order in zip(snodes, broadcast_orders, strict=True):
+                if order != tuple(range(len(order))):
+                    sn.apply_new_loop_order(order)
 
         for sn in snodes:
             if needs_expansion:
@@ -8569,13 +8588,13 @@ class Scheduler:
                 ):
                     expand_dim = len(iter_sizes) - 1
                 else:
-                    sn.apply_loop_reindexing([red_numel, pw_rnumel])
+                    sn.apply_loop_reindexing(target_iter_sizes)
                     expand_dim = 1
                 sn.expand_dimension_for_pointwise_node_with_masked_stores(
                     expand_dim, red_rnumel
                 )
-            elif tuple(sn._sizes[0]) != (red_numel, red_rnumel):
-                sn.apply_loop_reindexing([red_numel, red_rnumel])
+            elif tuple(sn._sizes[0]) != target_iter_sizes:
+                sn.apply_loop_reindexing(target_iter_sizes)
 
         if isinstance(pw_node, FusedSchedulerNode):
             pw_node.group = snodes[0].group
@@ -8754,6 +8773,42 @@ class Scheduler:
                 refresh_group_node_dependencies(pw_node)
 
         return True
+
+    @staticmethod
+    def _find_reduction_broadcast_orders(
+        reduction_outputs: Collection[str],
+        snodes: Sequence[SchedulerNode],
+        red_numel: sympy.Expr,
+    ) -> list[tuple[int, ...]] | None:
+        """Group reduction-output dimensions before broadcast dimensions."""
+        orders: list[tuple[int, ...]] = []
+        for sn in snodes:
+            iter_sizes = sn._sizes[0]
+            if sn._body is None or len(iter_sizes) <= 2:
+                return None
+
+            reads = [
+                dep
+                for dep in sn.read_writes.reads
+                if isinstance(dep, MemoryDep) and dep.name in reduction_outputs
+            ]
+            if len(reads) != 1 or reads[0].is_indirect():
+                return None
+
+            dep = reads[0]
+            loop_vars = sn.read_writes.range_vars
+            if loop_vars is None or len(loop_vars) != len(iter_sizes):
+                return None
+            used = dep.index.free_symbols
+            indexed = tuple(i for i, var in enumerate(loop_vars) if var in used)
+            broadcast = tuple(i for i, var in enumerate(loop_vars) if var not in used)
+            if not V.graph.sizevars.statically_known_equals(
+                sympy_product(iter_sizes[i] for i in indexed), red_numel
+            ):
+                return None
+            orders.append(indexed + broadcast)
+
+        return orders
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
