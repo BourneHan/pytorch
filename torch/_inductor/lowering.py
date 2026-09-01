@@ -28,6 +28,7 @@ from torch._functorch._aot_autograd.descriptors import (
     SavedForBackwardsNoVcCheckAOTOutput,
 )
 from torch._higher_order_ops.associative_scan import associative_scan_op
+from torch._higher_order_ops.flydsl_kernel_wrap import flydsl_kernel_wrapper_mutation
 from torch._higher_order_ops.triton_kernel_wrap import triton_kernel_wrapper_mutation
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class_obj
@@ -104,7 +105,6 @@ from .utils import (
     use_scatter_fallback,
 )
 from .virtualized import ops, V
-
 
 if TYPE_CHECKING:
     from .ir import BaseConstant
@@ -9132,8 +9132,25 @@ def resize(x, size, *, memory_format=None):
 
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
-
 make_fallback(auto_functionalized)
+
+
+@register_lowering(flydsl_kernel_wrapper_mutation)
+def flydsl_kernel_wrap_(
+    *,
+    launcher_idx: int,
+    call_spec_idx: int,
+    args: tuple[Any, ...],
+    mutated_arg_indices: tuple[int, ...],
+) -> None:
+    from torch._inductor.codegen.flydsl.user_defined_kernel import lower_flydsl_kernel
+
+    lower_flydsl_kernel(
+        launcher_idx=launcher_idx,
+        call_spec_idx=call_spec_idx,
+        args=args,
+        mutated_arg_indices=mutated_arg_indices,
+    )
 
 
 @register_lowering(triton_kernel_wrapper_mutation)
@@ -9634,7 +9651,6 @@ def with_effects(token, op, *args, **kwargs):
 
 from .comm_lowering import register_comm_lowerings, register_symm_mem_lowerings
 
-
 register_comm_lowerings()
 register_symm_mem_lowerings()
 
@@ -9752,7 +9768,6 @@ def lower_inline_asm_elementwise(
 # populate lowerings defined in kernel/*
 from . import kernel
 
-
 import_submodule(kernel)
 
 from . import (
@@ -9760,7 +9775,6 @@ from . import (
     mkldnn_lowerings,  # noqa: F401  # registers oneDNN fusion ops on import
     quantized_lowerings,
 )
-
 
 jagged_lowerings.register_jagged_ops()
 quantized_lowerings.register_quantized_ops()
