@@ -17,7 +17,24 @@ install_ubuntu() {
     # directly instead of using PyTorch's ROCM_PATH-aware LoadHIP.cmake.
     {
         printf 'export CMAKE_PREFIX_PATH=%q:${CMAKE_PREFIX_PATH:-}\n' "${ROCM_HOME}"
-        printf 'export LD_LIBRARY_PATH=%q:${LD_LIBRARY_PATH:-}\n' "${ROCM_HOME}/lib"
+        # Host libomp.so used to live at lib/llvm/lib. When amd-llvm includes
+        # openmp/device, TheRock sets LLVM_RUNTIME_TARGETS=default;amdgcn-amd-amdhsa
+        # (TheRock #1639) so LLVM installs host runtimes under lib/llvm/lib/<triple>/
+        # and does not collide with GPU copies. TheRock still rpaths only
+        # lib/llvm/lib, and CI only exported $ROCM_HOME/lib, so import torch failed
+        # on 10.1.0a20260829+. Add whichever directories actually contain libomp.so.
+        rocm_ld_path="${ROCM_HOME}/lib"
+        if [[ -d "${ROCM_HOME}/lib/llvm" ]]; then
+          while IFS= read -r omp_so; do
+            [[ -z "${omp_so}" ]] && continue
+            omp_dir="$(dirname "${omp_so}")"
+            case ":${rocm_ld_path}:" in
+              *":${omp_dir}:"*) ;;
+              *) rocm_ld_path="${rocm_ld_path}:${omp_dir}" ;;
+            esac
+          done < <(find "${ROCM_HOME}/lib/llvm" -name 'libomp.so' 2>/dev/null || true)
+        fi
+        printf 'export LD_LIBRARY_PATH=%q:${LD_LIBRARY_PATH:-}\n' "${rocm_ld_path}"
         if [[ -n "${USE_MSLK:-}" ]]; then
             printf 'export USE_MSLK=%q\n' "${USE_MSLK}"
         fi
