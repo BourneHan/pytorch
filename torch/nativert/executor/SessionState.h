@@ -21,10 +21,11 @@ class SessionState {
       : producers_(std::move(producers)), frame_(frame) {}
 
   C10_ALWAYS_INLINE void wait() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&]() {
-      return workOutstanding_.load(std::memory_order_seq_cst) == 0;
-    });
+    auto outstanding = workOutstanding_.load(std::memory_order_seq_cst);
+    while (outstanding != 0) {
+      workOutstanding_.wait(outstanding, std::memory_order_seq_cst);
+      outstanding = workOutstanding_.load(std::memory_order_seq_cst);
+    }
   }
 
   C10_ALWAYS_INLINE void addWork(uint32_t ct = 1) {
@@ -33,8 +34,7 @@ class SessionState {
 
   C10_ALWAYS_INLINE void removeWork() {
     if (workOutstanding_.fetch_sub(1, std::memory_order_seq_cst) == 1) {
-      std::unique_lock<std::mutex> lock(mutex_);
-      cv_.notify_one();
+      workOutstanding_.notify_one();
     }
   }
 
@@ -52,9 +52,6 @@ class SessionState {
  private:
   std::atomic_uint_fast32_t workOutstanding_;
   c10::FastMap<const Node*, std::uint_fast32_t> producers_;
-
-  std::condition_variable cv_;
-  std::mutex mutex_;
 
   ExecutionFrame& frame_;
 };
