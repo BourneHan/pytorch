@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 import weakref
 from collections.abc import Iterator
 from typing import NamedTuple
@@ -19,7 +20,7 @@ import torch.fx.graph as fx_graph
 import torch.onnx.operators
 import torch.utils.cpp_extension
 from torch._dynamo.bytecode_transformation import transform_code_object
-from torch._dynamo.exc import PackageError
+from torch._dynamo.exc import GuardSerializationError, PackageError
 from torch._dynamo.guards import CheckFunctionManager, CompileId
 from torch._dynamo.package import CompilePackage
 from torch._dynamo.source import LocalSource
@@ -473,6 +474,27 @@ class TestGuardSerializationBase(torch._inductor.test_case.TestCase):
         self.assertEqual(ref.check(inputs), expected)
         self.assertEqual(ref.check(inputs), loaded.check(inputs))
 
+    def _compile_with_package(self, fn, *args):
+        # One compile of fn under a fresh CompilePackage; returns the output
+        # and the package so callers can inspect the entry's bypassed flag.
+        torch._dynamo.reset()
+        package = CompilePackage(fn)
+        compiled = torch._dynamo.optimize(backend="eager", package=package)(fn)
+        try:
+            return compiled(*args), package
+        finally:
+            torch._dynamo.reset()
+
+    def _compile_bypassing_package(self, fn, *args):
+        # Non-strict contract: the compile succeeds, the package entry is
+        # bypassed and the single bypass warning names the failure.
+        with self.assertLogs("torch._dynamo.output_graph", level="WARNING") as logs:
+            out, package = self._compile_with_package(fn, *args)
+        self.assertTrue(package.cache_entry().codes[0].bypassed)
+        bypasses = [line for line in logs.output if "Detected a package bypass" in line]
+        self.assertEqual(len(bypasses), 1)
+        return out, bypasses[0]
+
 
 @torch._dynamo.config.patch({"strict_precompile": True})
 class TestGuardSerialization(TestGuardSerializationBase):
@@ -554,9 +576,11 @@ class TestGuardSerialization(TestGuardSerializationBase):
             return m(x)
 
         with self.assertRaisesRegex(
-            TypeError, "Please define the class at global scope"
-        ):
+            PackageError, "Please define the class at global scope"
+        ) as cm:
             self._test_serialization("TYPE_MATCH", fn, m, torch.randn(3))
+        self.assertIsInstance(cm.exception, GuardSerializationError)
+        self.assertEqual(cm.exception.guard_type, "TYPE_MATCH")
 
         m = GlobalModule()
         ref, loaded = self._test_serialization("TYPE_MATCH", fn, m, torch.randn(3))
@@ -1079,8 +1103,153 @@ class TestGuardSerialization(TestGuardSerializationBase):
 
         with self.assertRaisesRegex(
             PackageError, "ID_MATCH guard cannot be serialized."
-        ):
+        ) as cm:
             self._test_serialization("ID_MATCH", fn, torch.randn(3))
+        # The typed error names the failing guard; consumers must not have to
+        # parse the message.
+        self.assertIsInstance(cm.exception, GuardSerializationError)
+        self.assertEqual(cm.exception.guard_type, "ID_MATCH")
+        self.assertEqual(cm.exception.guard_name, "L['x']")
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_unserializable_guard_bypasses_package(self):
+        # Non-strict: an unserializable guard must not abort the compile.
+        # CheckFunctionManager bypasses the package entry and the frame still
+        # runs compiled, just uncached.
+        def fn(x):
+            return x + id(x)
+
+        x = torch.randn(3)
+        out, bypass = self._compile_bypassing_package(fn, x)
+        self.assertEqual(out, x + id(x))
+        self.assertIn("ID_MATCH guard cannot be serialized. (guard on L['x'])", bypass)
+
+    @torch._dynamo.config.patch({"strict_precompile": True})
+    def test_strict_unserializable_guard_raises_typed_error(self):
+        def fn(x):
+            return x + id(x)
+
+        with self.assertRaisesRegex(
+            GuardSerializationError,
+            "ID_MATCH guard cannot be serialized",
+        ) as cm:
+            self._compile_with_package(fn, torch.randn(3))
+        self.assertEqual(cm.exception.guard_type, "ID_MATCH")
+        self.assertEqual(cm.exception.guard_name, "L['x']")
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_bypass_leaves_caller_exception_intact(self):
+        # The swallowed failure is neither stored nor mutated. Its __context__
+        # is whatever the caller is handling, so an exception in flight around
+        # the compile keeps its traceback.
+        def fn(x):
+            return x + id(x)
+
+        try:
+            raise ValueError("in flight")
+        except ValueError as err:
+            self._compile_bypassing_package(fn, torch.randn(3))
+            self.assertIsNotNone(err.__traceback__)
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_local_type_bypasses_package(self):
+        class Local:
+            attr = 1
+
+        def fn(x, o):
+            return x + o.attr
+
+        x = torch.randn(3)
+        out, bypass = self._compile_bypassing_package(fn, x, Local())
+        self.assertEqual(out, x + 1)
+        expected = "TYPE_MATCH guard cannot be serialized. (guard on L['o'])"
+        self.assertIn(expected, bypass)
+        self.assertIn("defined in local scope", bypass)
+
+    @torch._dynamo.config.patch({"strict_precompile": True})
+    def test_strict_local_type_raises_typed_error(self):
+        # The local-scope TYPE_MATCH branch raises the same typed error as its
+        # siblings, not a bare TypeError.
+        class Local:
+            attr = 1
+
+        def fn(x, o):
+            return x + o.attr
+
+        with self.assertRaisesRegex(
+            GuardSerializationError, "defined in local scope"
+        ) as cm:
+            self._compile_with_package(fn, torch.randn(3), Local())
+        self.assertEqual(cm.exception.guard_type, "TYPE_MATCH")
+        self.assertEqual(cm.exception.guard_name, "L['o']")
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_unpicklable_guard_state_bypasses_package(self):
+        import threading
+
+        def fn(x, lk):
+            if lk.locked():
+                return x + 1
+            return x + 2
+
+        x = torch.randn(3)
+        out, bypass = self._compile_bypassing_package(fn, x, threading.Lock())
+        self.assertEqual(out, x + 2)
+        self.assertIn("Failed to pickle guard state: cannot pickle", bypass)
+
+    @torch._dynamo.config.patch({"strict_precompile": True})
+    def test_strict_unpicklable_guard_state_raises_package_error(self):
+        import threading
+
+        def fn(x, lk):
+            if lk.locked():
+                return x + 1
+            return x + 2
+
+        with self.assertRaisesRegex(
+            PackageError, "Failed to pickle guard state: cannot pickle"
+        ) as cm:
+            self._compile_with_package(fn, torch.randn(3), threading.Lock())
+        # The pickler cannot attribute the failure to a guard, so this stays a
+        # plain PackageError chained to the pickling exception.
+        self.assertNotIsInstance(cm.exception, GuardSerializationError)
+        self.assertIsInstance(cm.exception.__cause__, TypeError)
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_getstate_runtime_error_bypasses_package(self):
+        # pickler.dump runs user __getstate__/__reduce__; whatever they raise
+        # must become a bypass, not escape as InternalTorchDynamoError.
+        def fn(x, o):
+            return o.add(x)
+
+        x = torch.randn(3)
+        out, bypass = self._compile_bypassing_package(fn, x, MyClass())
+        self.assertEqual(out, x + 1)
+        self.assertIn("Failed to pickle guard state: Cannot pickle", bypass)
+
+    @torch._dynamo.config.patch({"strict_precompile": False})
+    def test_nonstrict_getstate_not_implemented_bypasses_package(self):
+        def fn(x, o):
+            return o.add(x)
+
+        x = torch.randn(3)
+        out, bypass = self._compile_bypassing_package(fn, x, MyClassNotSerializable())
+        self.assertEqual(out, x + 1)
+        self.assertIn("Failed to pickle guard state", bypass)
+
+    def test_pickling_does_not_touch_nonleaf_grad(self):
+        # Guard pickling carries a tensor's .grad along with it; on a non-leaf
+        # that does not retain grad the access itself warns, so it is gated.
+        def fn(x):
+            return x * 2
+
+        nonleaf = torch.randn(3, requires_grad=True) * 3
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            out, _ = self._compile_with_package(fn, nonleaf)
+        self.assertEqual(out, nonleaf * 2)
+        nonleaf_warnings = [str(m.message) for m in w if "non-leaf" in str(m.message)]
+        self.assertEqual(nonleaf_warnings, [])
 
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_id_match_with_config(self):

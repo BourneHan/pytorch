@@ -1962,9 +1962,12 @@ def _compile(
             )
 
         if package is not None:
-            if check_fn.guards_state is None:
-                raise AssertionError("check_fn.guards_state must not be None")
-            package.add_guarded_code(check_fn.guards_state, out_code)
+            # guards_state is None only when CheckFunctionManager swallowed a
+            # non-strict serialization failure; it has already bypassed the
+            # package entry (the add_* calls below are no-ops on a bypassed
+            # entry) and the compile continues uncached.
+            if check_fn.guards_state is not None:
+                package.add_guarded_code(check_fn.guards_state, out_code)
             package.add_inlined_source(output.tracing_context.traced_code)
             package.update_device_type(output.current_tracer.graph)
 
