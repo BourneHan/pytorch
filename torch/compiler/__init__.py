@@ -8,11 +8,12 @@ from typing_extensions import ParamSpec
 import torch
 from torch._higher_order_ops.invoke_subgraph import NestedCompileRegionOptions
 
-# ``torch.compiler.precompile``: example_inputs=[(...), ...] is the one calling
-# convention, and ``tracer`` picks the front-end -- make_fx takes a single call and
-# produces a self-contained Python source plus an acceleration cache, dynamo takes
-# several and produces a guarded multi-graph artifact spanning graph breaks and
-# recompilations. capture/load_package expose the manual form. Re-exported from the private impl, whose ``_PrecompileApi.__module__`` is forced to
+# ``torch.compiler.precompile``: example_inputs=[(...), ...] is the calling convention
+# (the 2.14 positional form survives under a FutureWarning, and ``accumulate`` drives
+# the calls from the caller's loop), and ``tracer`` picks the front-end -- make_fx
+# takes a single call and produces a self-contained Python source plus an acceleration
+# cache, dynamo takes several and produces a guarded multi-graph artifact spanning graph
+# breaks and recompilations. Re-exported from the private impl, whose ``_PrecompileApi.__module__`` is forced to
 # "torch.compiler" so this is the single public location. Distinct from
 # ``torch._dynamo.config.caching_precompile``
 # (a ``torch.compile`` guard-serialization caching mode), despite the shared word.
@@ -20,9 +21,16 @@ from torch._higher_order_ops.invoke_subgraph import NestedCompileRegionOptions
 # conventional ``except torch.compiler.PrecompileError`` works; its ``__module__`` is already
 # forced to "torch.compiler" in the impl module, matching this public location.
 from torch._precompile import (
+    AccumulatingCapture as AccumulatingCapture,
     precompile as precompile,
     PrecompiledCallable as PrecompiledCallable,
     PrecompileError as PrecompileError,
+)
+from torch.compiler._precompile_types import (
+    ExampleInput as ExampleInput,
+    FrameInvariants as FrameInvariants,
+    GuardFact as GuardFact,
+    PrecompileSummary as PrecompileSummary,
 )
 
 from . import config
@@ -51,8 +59,13 @@ __all__ = [
     "cudagraph_mark_warmup_incomplete",
     "load_compiled_function",
     "precompile",
+    "AccumulatingCapture",
+    "ExampleInput",
+    "FrameInvariants",
+    "GuardFact",
     "PrecompiledCallable",
     "PrecompileError",
+    "PrecompileSummary",
     "wrap_numpy",
     "is_compiling",
     "is_dynamo_compiling",
@@ -994,6 +1007,7 @@ def load_compiled_function(
     *,
     f_globals: dict[str, object] | None = None,
     external_data: dict[str, Any] | None = None,
+    guard_globals: dict[str, object] | None = None,
 ) -> Callable[..., Any]:
     """
     Load an aot-compiled function from a file.
@@ -1008,6 +1022,12 @@ def load_compiled_function(
         external_data: Optional data to be loaded into the runtime environment
                        of the compiled function. This should contain the same
                        data as AOTCompileResult.external_data returned from save_compiled_function() call.
+        guard_globals: Optional live global scope the serialized global guards are
+                       checked against, held by reference so a global rebound after
+                       load redirects dispatch. Defaults to the compiled function's
+                       own (reconstructed) globals. Loading injects Dynamo's synthetic
+                       ``__import_*`` module aliases into this scope for any alias not
+                       already bound there, and leaves them in place.
 
     Returns:
         A torch-compiled function with compilation preloaded from disk.
@@ -1015,4 +1035,6 @@ def load_compiled_function(
     from torch._dynamo.aot_compile import AOTCompiledFunction
 
     data = file.read()
-    return AOTCompiledFunction.deserialize(data, f_globals, external_data)
+    return AOTCompiledFunction.deserialize(
+        data, f_globals, external_data, guard_globals=guard_globals
+    )

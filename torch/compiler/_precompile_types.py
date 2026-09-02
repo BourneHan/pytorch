@@ -71,7 +71,54 @@ class PrecompileSummary:
     # the remedy differ -- but reported, because a capture that silently
     # discards a precondition should not look like one that had none.
     policy_dropped_guards: tuple[tuple[str, str], ...] = ()
+    # (guard_type, source, rendered check) for each dropped slot that HAS a
+    # rendered check. Some do not: EMPTY_NN_MODULE_HOOKS_DICT installs nothing
+    # under the default skip_nnmodule_hook_guards, and the global-state guards
+    # are checked in C++ against no source, so those appear in the drop lists
+    # with no entry here rather than with an empty one.
+    #
+    # A slot is identified by its type and its SOURCE (for HASATTR and the
+    # other sibling types, with the member spelled ``source{'member'}``), which
+    # is not always enough to judge the drop: a dropped
+    # ``('HASATTR', "counts['pixel']{'grad'}")`` may be the benign companion of
+    # a kept TENSOR_MATCH on ``counts['pixel']``, or the only thing standing
+    # between the artifact and an optional attribute going missing, and those
+    # want very different reactions. The rendered check shows what was
+    # compared and so tells them apart. Reported alongside the three lists
+    # rather than folded into them, so the slot tuples stay the identity the
+    # policy compares on.
+    dropped_guard_code: tuple[tuple[str, str, str], ...] = ()
     capture_errors: tuple[str, ...] = ()
+    # Variants whose serialized guards, after every drop, keep NO guard whose
+    # source is rooted at a local of the frame (a call argument or a local it
+    # was traced with). Only global-state and unmodelled leaves survived, so
+    # the variant is served to any call that reaches its frame.
+    #
+    # Detects exactly that and no more: a variant counts as input-guarded if
+    # ANY kept, modelled guard is rooted at a local, whatever it checks. A
+    # frame whose only local-rooted guard is a TYPE_MATCH on the model, or an
+    # ID_MATCH on a callable argument, does NOT count here even though no
+    # tensor shape or value of its inputs is checked. Not a gate, because a
+    # frame with no tensor arguments legitimately looks like this; reported so
+    # a capture that lost its input checks is not mistaken for one that had
+    # none.
+    variants_without_input_guards: int = 0
+    # (leaf class, rendered check) for every guard that rebuilt from its own
+    # pickle into a check the live capture never made; see
+    # PrecompileSession._report_guard_drift. Each will miss at serve time.
+    # Describes the render this summary belongs to, like policy_dropped_guards:
+    # an accumulating capture re-renders after every call and this is the
+    # drift in the artifact being written now, not the union over all of them.
+    drifted_guards: tuple[tuple[str, str], ...] = ()
+    # (backend id, reason) for each compiled subgraph that could not be
+    # composed to readable source and so ships only in the pickled bundle. The
+    # reason is the exception class and message from the compose attempt. A
+    # subgraph is meant to render -- it is Inductor output, which has a source
+    # form -- so an entry here is a readable artifact that silently became an
+    # opaque one; empty for backend="eager", which has nothing to render.
+    # Populated by rendering, so it is filled in on the summary written into
+    # an artifact header and empty on a summary() taken before any render.
+    unrendered_backends: tuple[tuple[str, str], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -126,9 +173,17 @@ class PrecompileSummary:
             base += f", {len(self.bypassed)} BYPASSED: {list(self.bypassed)}"
         if self.capture_errors:
             base += f", {len(self.capture_errors)} CAPTURE ERROR(S)"
+        if self.variants_without_input_guards:
+            base += f", {self.variants_without_input_guards} variant(s) with NO input guards"
+        if self.drifted_guards:
+            base += f", {len(self.drifted_guards)} DRIFTED guard(s)"
+        if self.unrendered_backends:
+            base += f", {len(self.unrendered_backends)} UNRENDERED subgraph(s)"
         return base
 
 
+# Exported from torch.compiler, so pickling and Sphinx anchor them there.
+ExampleInput.__module__ = "torch.compiler"
 GuardFact.__module__ = "torch.compiler"
 FrameInvariants.__module__ = "torch.compiler"
 PrecompileSummary.__module__ = "torch.compiler"

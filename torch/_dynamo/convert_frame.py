@@ -597,6 +597,9 @@ def get_compile_id(
         raise AssertionError(f"frame_id must be an int, got {type(frame_id)}")
 
     if get_eval_frame_isolate_recompiles_id() >= 0:
+        # Per-region compile ids: each region's frame_state dict has its own
+        # _id, so (frame_id, frame_compile_id) stays unique without the global
+        # counter.
         frame_compile_id = frame_state.get("_compile_id", 0)
         if not isinstance(frame_compile_id, int):
             raise AssertionError(
@@ -636,6 +639,9 @@ class ConvertFrameAssert:
         self._package = package
         self._recompile_limit = recompile_limit
         self._box = ConvertFrameBox()
+
+    def set_package(self, package: CompilePackage) -> None:
+        self._package = package
 
     @property
     def _clone_with_backend(self) -> Callable[[CompilerFn], ConvertFrameAssert]:
@@ -2039,9 +2045,13 @@ def _compile(
         if package is not None:
             if check_fn.guards_state is None:
                 raise AssertionError("check_fn.guards_state must not be None")
-            package.add_guarded_code(check_fn.guards_state, out_code)
-            package.add_inlined_source(output.tracing_context.traced_code)
-            package.update_device_type(output.current_tracer.graph)
+            # Checked first: a variant the package refuses (CPU codegen config
+            # moved) records neither guarded code nor a backend id.
+            if package.update_device_type(output.current_tracer.graph):
+                package.add_guarded_code(check_fn.guards_state, out_code)
+                package.add_inlined_source(output.tracing_context.traced_code)
+            else:
+                package.discard_variant_backends(out_code)
 
         compile_id_str = str(compile_id) if compile_id is not None else "Unknown"
         annotation_str = "Torch-Compiled Region: " + compile_id_str
@@ -2451,6 +2461,9 @@ class ConvertFrame:
         self._hooks = hooks
         self._recompile_limit = recompile_limit
 
+    def set_package(self, package: CompilePackage) -> None:
+        self._inner_convert.set_package(package)
+
     @property
     def _clone_with_backend(self) -> Callable[[WrapBackendDebug], ConvertFrame]:
         # Used by DDPOptimizer to swap in its own backend.
@@ -2660,6 +2673,12 @@ class CatchErrorsWrapper:
         functools.wraps(callback)(self)
         self._torchdynamo_orig_backend = callback
         self.hooks = hooks
+
+    def set_package(self, package: CompilePackage) -> None:
+        inner = self._torchdynamo_orig_backend
+        if not isinstance(inner, (ConvertFrame, ConvertFrameAssert)):
+            raise AssertionError(f"cannot set a package on {type(inner)}")
+        inner.set_package(package)
 
     def _handle_skip(
         self, result: ConvertFrameReturn, frame: DynamoFrameType
