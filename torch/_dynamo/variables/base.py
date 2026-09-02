@@ -879,7 +879,11 @@ def _wrap_descr_set(
         raise_type_error(tx, "this method takes no keyword arguments")
     if len(args) != 2:
         raise_type_error(tx, f"expected 2 arguments, got {len(args)}")
-    return func(self, tx, args[0], args[1])
+    # Realize obj before it is used as a mutation-tracking key (store_attr_mutation
+    # etc. key by VT identity): a still-lazy wrapper here would be tracked under a
+    # different identity than the one later LOAD_ATTR reads resolve to once the
+    # same local is realized elsewhere, silently hiding the mutation from them.
+    return func(self, tx, args[0].realize(), args[1])
 
 
 def _wrap_descr_delete(
@@ -895,7 +899,8 @@ def _wrap_descr_delete(
         raise_type_error(tx, "this method takes no keyword arguments")
     if len(args) != 1:
         raise_type_error(tx, f"expected 1 argument, got {len(args)}")
-    return func(self, tx, args[0], None)
+    # See _wrap_descr_set: realize before using obj as a mutation-tracking key.
+    return func(self, tx, args[0].realize(), None)
 
 
 class SlotGroup(Enum):
@@ -2055,6 +2060,27 @@ class VariableTracker(metaclass=VariableTrackerMeta):
         UDOV overrides to check self.value.__dict__ + side effects.
         """
         return None
+
+    def tp_descr_set_impl(
+        self,
+        tx: InstructionTranslatorBase,
+        obj: VariableTracker,
+        value: VariableTracker | None,
+    ) -> VariableTracker:
+        """Mirrors CPython's tp_descr_set slot (``value is None`` deletes).
+
+        Dispatched by the "__set__"/"__delete__" TPSLOT entries (via
+        _wrap_descr_set/_wrap_descr_delete) for any type whose
+        PyTypeSlots.TP_DESCR_SET bit is set. Subclasses override to provide
+        the actual descriptor write.
+        """
+        unimplemented(
+            gb_type="tp_descr_set_impl not implemented",
+            context=f"{type(self).__name__} has tp_descr_set slot but no tp_descr_set_impl override",
+            explanation=f"The type {self.python_type_name()} has a tp_descr_set C slot but "
+            "Dynamo has no model for it.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
 
     def call_getattr_fallback(
         self, tx: InstructionTranslatorBase, name: str
