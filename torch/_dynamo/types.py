@@ -24,7 +24,7 @@ from torch._C._dynamo.eval_frame import (
     _FrameExecStrategy as FrameExecStrategy,
     _PyInterpreterFrame as DynamoFrameType,
 )
-from torch._guards import CompileId, Guard
+from torch._guards import CompileId, Guard, GuardProvenance
 
 
 # We use a dict to store additional data per frame.
@@ -45,8 +45,18 @@ class GuardFilterEntry:
     value: object
     guard_type: str
     derived_guard_types: tuple[str, ...]
+    # True iff the guard's source is rooted at exactly a GlobalSource
+    # (narrower than provenance GLOBAL, which also covers imports); kept for
+    # backward compatibility with existing filters.
     is_global: bool
     orig_guard: Guard
+
+    @property
+    def provenance(self) -> GuardProvenance:
+        # Where the guard's source chain is rooted; see Note [Guard provenance]
+        # in torch/_guards.py. Computed on demand so an unclassified
+        # out-of-tree Source only fails the filter that asks for it.
+        return self.orig_guard.provenance
 
 
 class GuardFn(Protocol):
