@@ -1035,6 +1035,1520 @@ def forward(self, primals_1):
         self.assertEqual(x_ref.grad, x_test.grad)
         self.assertEqual(x_ref_view.grad, x_test_view.grad)
 
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_prune_independent_branches(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x, y, z):
+            return x.sin(), y.sin(), z.sin()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        z_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+        z_test = z_ref.detach().clone().requires_grad_()
+
+        out_ref = fn(x_ref, y_ref, z_ref)
+        out_test = compiled_fn(x_test, y_test, z_test)
+
+        out_ref[0].sum().backward()
+        out_test[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(z_ref.grad)
+        self.assertIsNone(y_test.grad)
+        self.assertIsNone(z_test.grad)
+        self.assertEqual(
+            sum(
+                node.target is torch.ops.aten.cos.default
+                for node in bw_graphs[0].graph.nodes
+            ),
+            1,
+        )
+
+    def test_unresolved_none_tangent_names_the_forward_output(self):
+        import torch._functorch._aot_autograd.graph_compile as graph_compile
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        def fn(x):
+            y = torch.sin(x)
+            return y[0:4], y[4:8], y.detach(), x * 3
+
+        torch._dynamo.reset()
+        x = torch.arange(8, dtype=torch.float32).requires_grad_(True)
+        with (
+            patch.object(
+                runtime_wrappers, "_dealias_marked_returns", lambda raw, marked: None
+            ),
+            patch.object(
+                graph_compile,
+                "_retrace_backward_for_undefined_grad_outputs",
+                lambda *args, **kwargs: None,
+            ),
+            patch.object(
+                runtime_wrappers,
+                "_specialize_bw_module_for_undefined_grad_outputs",
+                lambda *args, **kwargs: None,
+            ),
+            patch.object(
+                runtime_wrappers, "_grad_output_prototype", lambda *args, **kwargs: None
+            ),
+        ):
+            outputs = torch.compile(fn, backend="inductor")(x)
+            with self.assertRaisesRegex(
+                RuntimeError, "handed a non-Tensor for a tangent it requires"
+            ) as cm:
+                outputs[3].sum().backward()
+
+        msg = str(cm.exception)
+        self.assertIn("tangent index         : 1", msg)
+        self.assertIn("received              : None (type NoneType", msg)
+        self.assertIn("IntermediateBaseAOTOutput(base_of=PlainAOTOutput(idx=0))", msg)
+        self.assertIn("that slot holds       : intermediate base 0", msg)
+        self.assertIn("user output index     : 0", msg)
+        self.assertIn("OutputType.alias_of_intermediate_save_as_output", msg)
+        self.assertIn("its requires_grad     : True", msg)
+        self.assertIn("its dtype             : torch.float32", msg)
+        self.assertIn("This slot is case (2) or (3)", msg)
+
+    @parametrize("fallback", ("retrace", "structural", "materialize"))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_none_tangent_resolution_precedes_diagnostic(self, fallback):
+        import torch._functorch._aot_autograd.graph_compile as graph_compile
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        def fn(x):
+            y = torch.sin(x)
+            return y[0:4], y[4:8], y.detach(), x * 3
+
+        def unexpected_fallback(*args):
+            self.fail(f"unexpected fallback for {fallback}")
+
+        torch._dynamo.reset()
+        x = torch.arange(8, dtype=torch.float32).requires_grad_(True)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    runtime_wrappers,
+                    "_dealias_marked_returns",
+                    lambda raw, marked: None,
+                )
+            )
+            if fallback == "retrace":
+                stack.enter_context(
+                    patch.object(
+                        runtime_wrappers,
+                        "_specialize_bw_module_for_undefined_grad_outputs",
+                        unexpected_fallback,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runtime_wrappers,
+                        "_materialize_missing_tangent_args",
+                        unexpected_fallback,
+                    )
+                )
+            else:
+                stack.enter_context(
+                    patch.object(
+                        graph_compile,
+                        "_retrace_backward_for_undefined_grad_outputs",
+                        lambda *args, **kwargs: None,
+                    )
+                )
+            if fallback == "structural":
+                stack.enter_context(
+                    patch.object(
+                        runtime_wrappers,
+                        "_materialize_missing_tangent_args",
+                        unexpected_fallback,
+                    )
+                )
+            elif fallback == "materialize":
+                stack.enter_context(
+                    patch.object(
+                        runtime_wrappers,
+                        "_specialize_bw_module_for_undefined_grad_outputs",
+                        lambda *args, **kwargs: None,
+                    )
+                )
+            torch.compile(fn, backend="inductor")(x)[3].sum().backward()
+
+        self.assertEqual(x.grad, torch.full_like(x, 3))
+
+    def test_none_tangent_error_reports_non_differentiable_dtype(self):
+        # Integer outputs are normally pruned before tangent processing, so drive
+        # this diagnostic classification directly.
+        from torch._functorch._aot_autograd.descriptors import (
+            PlainAOTOutput,
+            TangentAOTInput,
+        )
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _non_tensor_tangent_error,
+            KeptTangentInfo,
+        )
+
+        info = KeptTangentInfo(
+            grad_out_idx=(0, 2),
+            dtype=(torch.float32, torch.int64),
+            num_mutated_inputs=0,
+            num_outputs=3,
+            num_intermediate_bases=0,
+            output_type=("non_alias",) * 3,
+            output_requires_grad=(True, False, True),
+            output_requires_grad_for_backward=(True, False, True),
+        )
+        msg = str(
+            _non_tensor_tangent_error(
+                None, 1, TangentAOTInput(PlainAOTOutput(idx=2)), "1/0", "here\n", info
+            )
+        )
+        self.assertIn("user output index     : 2", msg)
+        self.assertIn("its dtype             : torch.int64", msg)
+        self.assertIn("torch.int64 is not a differentiable dtype", msg)
+        self.assertIn("This error occurred in compiled graph [1/0].", msg)
+        self.assertIn("The forward output was created here:\nhere", msg)
+
+    def test_none_tangent_subclass_attribute_without_kept_slot_is_accepted(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import AOTDispatchAutograd
+        from torch._functorch._aot_autograd.schemas import PlainTensorMeta
+
+        # Recursive subclass attributes do not identify a top-level tangent slot.
+        tangent, flat = AOTDispatchAutograd.process_runtime_tangent(
+            None, PlainTensorMeta(0)
+        )
+        self.assertIsNone(tangent)
+        self.assertEqual(flat, [None])
+
+    def test_none_tangent_for_a_dropped_slot_still_passes_through(self):
+        def fn(x, lengths):
+            y = torch.sin(x)
+            return (
+                y[0:4],
+                y[4:8],
+                lengths * 2,
+                lengths > 1,
+                (x * 2).detach(),
+                x[0:2],
+                x * 3,
+            )
+
+        def run(fn, x, lengths):
+            outputs = fn(x, lengths)
+            (outputs[0].sum() + outputs[1].sum() + outputs[6].sum()).backward()
+            return x.grad
+
+        torch._dynamo.reset()
+        lengths = torch.arange(4)
+        x_ref = torch.randn(8, requires_grad=True)
+        expected = run(fn, x_ref, lengths)
+        x = x_ref.detach().clone().requires_grad_(True)
+        actual = run(torch.compile(fn, backend="inductor"), x, lengths)
+        self.assertEqual(actual, expected)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=False)
+    def test_unused_differentiable_outputs_pruning_kill_switch(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x, y, z):
+            return x.sin(), y.sin(), z.sin()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+        x, y, z = (torch.randn(4, requires_grad=True) for _ in range(3))
+        compiled_fn(x, y, z)[0].sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertEqual(y.grad, torch.zeros_like(y))
+        self.assertEqual(z.grad, torch.zeros_like(z))
+        self.assertEqual(
+            sum(
+                node.target is torch.ops.aten.cos.default
+                for node in bw_graphs[0].graph.nodes
+            ),
+            3,
+        )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_prune_shared_input_branches(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x):
+            return x.sin(), x.cos(), x.tan()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+
+        out_ref = fn(x_ref)
+        out_test = compiled_fn(x_test)
+
+        out_ref[0].sum().backward()
+        out_test[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        bw_targets = [node.target for node in bw_graphs[0].graph.nodes]
+        self.assertEqual(bw_targets.count(torch.ops.aten.cos.default), 1)
+        self.assertEqual(bw_targets.count(torch.ops.aten.sin.default), 0)
+        self.assertEqual(bw_targets.count(torch.ops.aten.pow.Tensor_Scalar), 0)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_prune_backward_ops(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x, y, z):
+            return x.sin(), y.relu(), z.relu()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        z_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+        z_test = z_ref.detach().clone().requires_grad_()
+
+        out_ref = fn(x_ref, y_ref, z_ref)
+        out_test = compiled_fn(x_test, y_test, z_test)
+
+        out_ref[0].sum().backward()
+        out_test[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(z_ref.grad)
+        self.assertIsNone(y_test.grad)
+        self.assertIsNone(z_test.grad)
+        bw_targets = [node.target for node in bw_graphs[0].graph.nodes]
+        self.assertEqual(bw_targets.count(torch.ops.aten.cos.default), 1)
+        self.assertNotIn(torch.ops.aten.threshold_backward.default, bw_targets)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_python_callable_not_retraced(self):
+        # The joint traces Fn.backward with every tangent defined. A Python
+        # callable is never re-executed at backward time to observe the None
+        # tangent (that would replay user code with whatever state it has by
+        # then), so the pruned grad is None rather than eager's x * 7.
+        class Fn(torch.autograd.Function):
+            @staticmethod
+            def forward(x, y):
+                return x * 2, y * 3
+
+            @staticmethod
+            def setup_context(ctx, inputs, output):
+                ctx.set_materialize_grads(False)
+                x, _ = inputs
+                ctx.save_for_backward(x)
+
+            @staticmethod
+            def backward(ctx, grad_x, grad_y):
+                (x,) = ctx.saved_tensors
+                if grad_y is None:
+                    return grad_x * x, x * 7
+                return grad_x * x, grad_y * x
+
+        def fn(x, y):
+            return Fn.apply(x, y)
+
+        def bw_compiler(gm, inputs):
+            self.assertTrue(all(value is not None for value in inputs))
+            return gm
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        out = compiled_fn(x, y)
+        lazy_info = out[0].grad_fn._forward_cls._lazy_backward_info
+        self.assertIsNone(lazy_info.autograd_trace_info)
+        out[0].sum().backward()
+        self.assertEqual(x.grad, x)
+        self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_subclass_outputs_pruned_to_none(self):
+        @torch.compile(backend="aot_eager")
+        def fn(x, y):
+            return x.sin(), y.sin()
+
+        def make_two_tensor():
+            a = torch.randn(4, requires_grad=True)
+            b = torch.randn(4, requires_grad=True)
+            return TwoTensor(a, b), a, b
+
+        x_ref, xa_ref, xb_ref = make_two_tensor()
+        y_ref, ya_ref, yb_ref = make_two_tensor()
+        x_test = TwoTensor(
+            xa_ref.detach().clone().requires_grad_(),
+            xb_ref.detach().clone().requires_grad_(),
+        )
+        y_test = TwoTensor(
+            ya_ref.detach().clone().requires_grad_(),
+            yb_ref.detach().clone().requires_grad_(),
+        )
+
+        def fn_ref(x, y):
+            return x.sin(), y.sin()
+
+        fn_ref(x_ref, y_ref)[0].sum().backward()
+        fn(x_test, y_test)[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertTrue(isinstance(x_test.grad, TwoTensor))
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(y_test.grad)
+        self.assertEqual(xa_ref.grad, x_test.a.grad)
+        self.assertEqual(xb_ref.grad, x_test.b.grad)
+        self.assertIsNone(ya_ref.grad)
+        self.assertIsNone(yb_ref.grad)
+        self.assertIsNone(y_test.a.grad)
+        self.assertIsNone(y_test.b.grad)
+
+    @parametrize("include_view_output", (False, True))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_with_view_output(self, include_view_output):
+        torch._dynamo.reset()
+
+        @torch.compile(backend="aot_eager")
+        def fn(x):
+            return x.sin(), x.view(-1)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+
+        y0_ref, y1_ref = x_ref.sin(), x_ref.view(-1)
+        y0_test, y1_test = fn(x_test)
+
+        loss_ref = y0_ref.sum()
+        loss_test = y0_test.sum()
+        if include_view_output:
+            loss_ref = loss_ref + y1_ref.sum()
+            loss_test = loss_test + y1_test.sum()
+
+        loss_ref.backward()
+        loss_test.backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_with_intermediate_base(self):
+        def fn(x, y):
+            base = x.sin()
+            return base.detach(), base.view(-1), y.cos()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        ref_detached, ref_view, _ = fn(x_ref, y_ref)
+        test_detached, test_view, _ = compiled_fn(x_test, y_test)
+        self.assertEqual(test_detached, ref_detached)
+        self.assertEqual(test_view, ref_view)
+        self.assertEqual(test_detached.data_ptr(), test_view.data_ptr())
+
+        ref_view.sum().backward()
+        test_view.sum().backward()
+        self.assertEqual(x_test.grad, x_ref.grad)
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(y_test.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_multiple_masks_retain_graph(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x, y, z):
+            return x.sin(), y.sin(), z.sin()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        z = torch.randn(4, requires_grad=True)
+
+        out = compiled_fn(x, y, z)
+        out[0].sum().backward(retain_graph=True)
+        self.assertIsNotNone(x.grad)
+        self.assertIsNone(y.grad)
+        self.assertIsNone(z.grad)
+        self.assertEqual(
+            sum(
+                node.target is torch.ops.aten.cos.default
+                for node in bw_graphs[-1].graph.nodes
+            ),
+            1,
+        )
+
+        out[1].sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertIsNotNone(y.grad)
+        self.assertIsNone(z.grad)
+        self.assertEqual(len(bw_graphs), 2)
+        self.assertEqual(
+            sum(
+                node.target is torch.ops.aten.cos.default
+                for node in bw_graphs[-1].graph.nodes
+            ),
+            1,
+        )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_backward_outside_autocast(self):
+        # The forward is compiled under ambient autocast; the backward-time
+        # retrace must not rerun the joint trace under the caller's (different)
+        # autocast state.
+        def fn(x, y):
+            return (x @ y).sum(0), (x + y).sum(1)
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="aot_eager")
+
+        x_ref = torch.randn(4, 4, requires_grad=True)
+        y_ref = torch.randn(4, 4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        with torch.autocast("cpu", torch.bfloat16):
+            out_ref = fn(x_ref, y_ref)
+            out_test = compiled_fn(x_test, y_test)
+
+        out_ref[0].sum().backward()
+        out_test[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertEqual(y_ref.grad, y_test.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_precompile_autocast_fallback(self):
+        # Under caching_precompile, an autocast-declined retrace falls back to
+        # the ABI-preserving structural specialization like any other graph.
+        from torch._inductor.utils import fresh_cache
+
+        def fn(x, y):
+            return (x @ y).sum(0), (x + y).sum(1)
+
+        with torch._dynamo.config.patch(caching_precompile=True), fresh_cache():
+            torch._dynamo.reset()
+            compiled_fn = torch.compile(fn)
+
+            x_ref = torch.randn(4, 4, requires_grad=True)
+            y_ref = torch.randn(4, 4, requires_grad=True)
+            x_test = x_ref.detach().clone().requires_grad_()
+            y_test = y_ref.detach().clone().requires_grad_()
+
+            with torch.autocast("cpu", torch.bfloat16):
+                out_ref = fn(x_ref, y_ref)
+                out_test = compiled_fn(x_test, y_test)
+
+            aot_config = out_test[0].grad_fn._forward_cls._aot_config
+            self.assertIsNotNone(aot_config.precompile_backend_id)
+
+            out_ref[0].sum().backward()
+            out_test[0].sum().backward()
+
+            self.assertEqual(x_ref.grad, x_test.grad)
+            self.assertEqual(y_ref.grad, y_test.grad)
+
+    @parametrize("debug_assert", (False, True))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_retrace_assertion_error(self, debug_assert):
+        # An AssertionError inside the retrace is a violated invariant: it
+        # surfaces under debug_assert and is otherwise a warning plus fallback.
+        import torch._functorch._aot_autograd.graph_compile as graph_compile
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def asserting_retrace(*args, **kwargs):
+            raise AssertionError("injected retrace invariant violation")
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="aot_eager")
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        out = compiled_fn(x, y)
+        with (
+            patch.object(
+                graph_compile,
+                "_retrace_backward_for_undefined_grad_outputs",
+                asserting_retrace,
+            ),
+            torch._functorch.config.patch(debug_assert=debug_assert),
+        ):
+            if debug_assert:
+                with self.assertRaisesRegex(AssertionError, "injected retrace"):
+                    out[0].sum().backward()
+            else:
+                with self.assertLogs(
+                    "torch._functorch._aot_autograd.runtime_wrappers", level="WARNING"
+                ):
+                    out[0].sum().backward()
+                self.assertEqual(x.grad, x.cos())
+                self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_single_output_sole_undefined_tangent_materializes(self):
+        # A downstream custom Function returning None hands the sole tangent
+        # in undefined; with retrace and structural specialization both
+        # unavailable, the materialize fallback needs a prototype even for a
+        # single-differentiable-output graph.
+        class Affine(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                return x * 2
+
+            @staticmethod
+            def backward(ctx, g):
+                return g + 1
+
+        class DropGrad(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, y):
+                return y.clone()
+
+            @staticmethod
+            def backward(ctx, g):
+                return None
+
+        def fn(x):
+            return Affine.apply(x).sin()
+
+        def run(fn, x):
+            DropGrad.apply(fn(x)).sum().backward()
+            return x.grad
+
+        x_ref = torch.randn(4, requires_grad=True)
+        expected = run(fn, x_ref)
+        self.assertEqual(expected, torch.ones_like(x_ref))
+
+        torch._dynamo.reset()
+        x = x_ref.detach().clone().requires_grad_()
+        compiled = torch.compile(fn, backend="aot_eager", fullgraph=True)
+        self.assertEqual(run(compiled, x), expected)
+
+    def test_autocast_fingerprint_covers_non_input_devices(self):
+        # Autocast state on a device used only inside the traced region (never
+        # among the inputs) must still be able to decline the retrace.
+        from torch._functorch._aot_autograd.graph_compile import _autocast_fingerprint
+
+        baseline = _autocast_fingerprint()
+        prior = torch.is_autocast_enabled("xpu")
+        torch.set_autocast_enabled("xpu", True)
+        try:
+            changed = _autocast_fingerprint()
+        finally:
+            torch.set_autocast_enabled("xpu", prior)
+        self.assertNotEqual(baseline[1], changed[1])
+
+    @parametrize("path", ("structural", "mask"))
+    @parametrize("full_backward_first", (False, True))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_provably_zero_custom_backward(
+        self, path, full_backward_first
+    ):
+        # See Note [Pruned-tangent grads: None vs zeros]: for a custom Function
+        # whose backward is linear in the pruned tangent, eager materializes
+        # zeros, while the structural and mask paths cannot see custom-function
+        # provenance and prune the provably-zero grad to None. A custom
+        # Function's backward is inlined before AOTAutograd sees it, so the
+        # exact retrace never applies to it.
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        class Fn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, y):
+                return x * 2, y * 3
+
+            @staticmethod
+            def backward(ctx, g1, g2):
+                return g1 * 5, g2
+
+        def fn(x, y):
+            return Fn.apply(x, y)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        fn(x_ref, y_ref)[1].sum().backward()
+        self.assertEqual(x_ref.grad, torch.zeros_like(x_ref))
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        if full_backward_first:
+            x0, y0 = (torch.randn(4, requires_grad=True) for _ in range(2))
+            out0 = compiled_fn(x0, y0)
+            (out0[0].sum() + out0[1].sum()).backward()
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        out = compiled_fn(x, y)
+        with ExitStack() as stack:
+            if path == "mask":
+                stack.enter_context(
+                    patch.object(
+                        runtime_wrappers,
+                        "_specialize_bw_module_for_undefined_grad_outputs",
+                        lambda *args, **kwargs: None,
+                    )
+                )
+            out[1].sum().backward()
+        self.assertIsNone(x.grad)
+        self.assertEqual(y.grad, torch.ones_like(y))
+
+    def test_autograd_trace_info_capture_gated_on_config(self):
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def lazy_info_for_fresh_compile():
+            torch._dynamo.reset()
+            compiled_fn = torch.compile(fn, backend="aot_eager")
+            x = torch.randn(4, requires_grad=True)
+            y = torch.randn(4, requires_grad=True)
+            out = compiled_fn(x, y)
+            return out[0].grad_fn._forward_cls._lazy_backward_info
+
+        with torch._functorch.config.patch(aot_autograd_prune_unused_outputs=False):
+            self.assertIsNone(lazy_info_for_fresh_compile().autograd_trace_info)
+        with torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True):
+            self.assertIsNotNone(lazy_info_for_fresh_compile().autograd_trace_info)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_autograd_trace_info_only_for_graph_module_callables(self):
+        # The retrace re-executes the traced callable at backward time, so it
+        # is only captured for fx.GraphModule callables whose re-execution
+        # replays captured ops, never for arbitrary Python.
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def lazy_info_for(callable_):
+            compiled_fn = aot_function(callable_, fw_compiler=nop, bw_compiler=nop)
+            x = torch.randn(4, requires_grad=True)
+            y = torch.randn(4, requires_grad=True)
+            out = compiled_fn(x, y)
+            return out[0].grad_fn._forward_cls._lazy_backward_info
+
+        self.assertIsNone(lazy_info_for(fn).autograd_trace_info)
+        # aot_function's flattening wrapper hides the callable, so even a
+        # GraphModule given to it is not retraced; aot_module_simplified
+        # (torch.compile's entry point) exposes it.
+        gm = make_fx(fn)(torch.randn(4), torch.randn(4))
+        self.assertIsNone(lazy_info_for(gm).autograd_trace_info)
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        compiled_gm = aot_module_simplified(
+            gm, [x, y], fw_compiler=nop, bw_compiler=nop
+        )
+        out = compiled_gm(x, y)
+        lazy_info = out[0].grad_fn._forward_cls._lazy_backward_info
+        self.assertIsNotNone(lazy_info.autograd_trace_info)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_python_callable_keeps_forward_state(self):
+        # A Python callable compiled through aot_function must not be re-run
+        # at backward time: the gradient reflects the compiled forward even
+        # when the callable's environment changed in between.
+        scale = [2.0]
+
+        def fn(x, y):
+            return x * scale[0], y.cos()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        x = torch.randn(4, requires_grad=True)
+        y = torch.randn(4, requires_grad=True)
+        out = compiled_fn(x, y)
+        scale[0] = 3.0
+        out[0].sum().backward()
+        self.assertEqual(x.grad, torch.full_like(x, 2.0))
+        self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_retrace_failure_falls_back(self):
+        import torch._functorch._aot_autograd.graph_compile as graph_compile
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def raising_retrace(*args, **kwargs):
+            raise RuntimeError("injected retrace failure")
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="aot_eager")
+        out_ref = fn(x_ref, y_ref)
+        out_test = compiled_fn(x_test, y_test)
+
+        out_ref[0].sum().backward()
+        with patch.object(
+            graph_compile,
+            "_retrace_backward_for_undefined_grad_outputs",
+            raising_retrace,
+        ):
+            with self.assertLogs(
+                "torch._functorch._aot_autograd.runtime_wrappers", level="WARNING"
+            ):
+                out_test[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(y_test.grad)
+
+    @torch._functorch.config.patch(
+        aot_autograd_prune_unused_outputs=True, donated_buffer=True
+    )
+    def test_unused_differentiable_outputs_donated_variant_not_reused(self):
+        from torch._dynamo.backends.common import aot_autograd as aot_autograd_backend
+
+        bw_compiles = []
+
+        def bw_compiler(gm, example_inputs):
+            bw_compiles.append(gm)
+            return gm
+
+        def fn(x, w, y):
+            return torch.nn.functional.layer_norm(x @ w, [8]), y.cos()
+
+        def fresh():
+            x = torch.randn(4, 8, requires_grad=True)
+            w = torch.randn(8, 8, requires_grad=True)
+            y = torch.randn(4, requires_grad=True)
+            return x, w, y
+
+        backend = aot_autograd_backend(
+            fw_compiler=nop,
+            bw_compiler=bw_compiler,
+            partition_fn=min_cut_rematerialization_partition,
+        )
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend=backend)
+
+        # Compile a specialized (partial-backward) variant while donation is
+        # active (layer_norm saves donated intermediates).
+        x, w, y = fresh()
+        compiled_fn(x, w, y)[0].sum().backward()
+        self.assertEqual(len(bw_compiles), 1)
+
+        # A full retain_graph backward clears bw_donated_idxs and compiles the
+        # full backward without donation.
+        x, w, y = fresh()
+        out = compiled_fn(x, w, y)
+        (out[0].sum() + out[1].sum()).backward(retain_graph=True)
+        (out[0].sum() + out[1].sum()).backward()
+        self.assertEqual(len(bw_compiles), 2)
+
+        # With bw_donated_idxs cleared, the retain_graph guard cannot reject
+        # the donation-compiled variant anymore, so it must not be served.
+        x, w, y = fresh()
+        x_ref = x.detach().clone().requires_grad_()
+        w_ref = w.detach().clone().requires_grad_()
+        y_ref = y.detach().clone().requires_grad_()
+        out = compiled_fn(x, w, y)
+        out_ref = fn(x_ref, w_ref, y_ref)
+        out[0].sum().backward(retain_graph=True)
+        out_ref[0].sum().backward(retain_graph=True)
+        self.assertEqual(len(bw_compiles), 3)
+        out[0].sum().backward()
+        out_ref[0].sum().backward()
+        self.assertEqual(x.grad, x_ref.grad)
+        self.assertEqual(w.grad, w_ref.grad)
+        self.assertIsNone(y.grad)
+        self.assertIsNone(y_ref.grad)
+
+    @parametrize("custom_fn_kind", ("affine", "broadcast"))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_structural_fold_keeps_meta(
+        self, custom_fn_kind
+    ):
+        # Folding add(pruned_zero, rhs) -> rhs is only sound when rhs is a
+        # node with the same shape/dtype as the add; a scalar rhs (g1 + 1) or
+        # a broadcasting rhs (g1 + g2) must not be folded.
+        class AffineFn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, y):
+                return x * 2, y * 3
+
+            @staticmethod
+            def backward(ctx, g1, g2):
+                return g1 + 1, g2
+
+        class BroadcastFn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, y):
+                return x * 2, y.sum() * 3
+
+            @staticmethod
+            def backward(ctx, g1, g2):
+                return g1 + g2, g2 * torch.ones(4)
+
+        custom_fn = AffineFn if custom_fn_kind == "affine" else BroadcastFn
+
+        def fn(x, y):
+            return custom_fn.apply(x, y)
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        out_ref = fn(x_ref, y_ref)
+        out_test = compiled_fn(x_test, y_test)
+
+        out_ref[1].sum().backward()
+        out_test[1].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertEqual(y_ref.grad, y_test.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_affine_custom_backward_not_masked(self):
+        # A backward output computed from a pruned tangent is not necessarily
+        # zero (an affine custom backward like g1 + 1 gives ones in eager), so
+        # it must only be masked to None when it is provably zero.
+        class Fn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, y):
+                return x * 2, y * 3
+
+            @staticmethod
+            def backward(ctx, g1, g2):
+                return g1 + 1, g2
+
+        def fn(x, y):
+            return Fn.apply(x, y)
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+
+        # Full backward first so the full compiled backward is pinned.
+        x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+        out = compiled_fn(x, y)
+        (out[0].sum() + out[1].sum()).backward()
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        out_ref = fn(x_ref, y_ref)
+        out_test = compiled_fn(x_test, y_test)
+        # The affine backward declines structural specialization, so this runs
+        # the full backward with a materialized zero tangent and masks only
+        # provably-zero outputs.
+        out_ref[1].sum().backward()
+        out_test[1].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertEqual(y_ref.grad, y_test.grad)
+
+    @parametrize("full_backward_first", (False, True))
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_fallback_preserves_none_grads(
+        self, full_backward_first
+    ):
+        # std's backward masks a division result; the pruned zero must still be
+        # recognized as zero so the unused grad stays None whether or not the
+        # full backward compiled first.
+        def fn(x, y):
+            return x.sin(), y.std()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        if full_backward_first:
+            x_compile = torch.randn(4, requires_grad=True)
+            y_compile = torch.randn(4, requires_grad=True)
+            out_compile = compiled_fn(x_compile, y_compile)
+            (out_compile[0].sum() + out_compile[1].sum()).backward()
+
+        x_ref = torch.randn(4, requires_grad=True)
+        y_ref = torch.randn(4, requires_grad=True)
+        x_test = x_ref.detach().clone().requires_grad_()
+        y_test = y_ref.detach().clone().requires_grad_()
+
+        fn(x_ref, y_ref)[0].sum().backward()
+        compiled_fn(x_test, y_test)[0].sum().backward()
+
+        self.assertEqual(x_ref.grad, x_test.grad)
+        self.assertIsNone(y_ref.grad)
+        self.assertIsNone(y_test.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_grad_output_prototypes_do_not_retain_wrapper_storage(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _flat_zeros_like_tangent_prototype,
+        )
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        @torch.compile(backend="aot_eager")
+        def fn(x):
+            return x.sin(), x.cos()
+
+        a = torch.randn(4096, requires_grad=True)
+        b = torch.randn(4096, requires_grad=True)
+        out, unused = fn(TwoTensor(a, b))
+        ctx = out.grad_fn
+        a_storage = StorageWeakRef(out.a.untyped_storage())
+        b_storage = StorageWeakRef(out.b.untyped_storage())
+
+        tangent_meta = ctx._forward_cls.metadata.subclass_tangent_meta[0]
+        prototype = ctx._aot_grad_output_prototypes[0]
+        prototype_objects = ctx._aot_grad_output_prototype_objects
+        flat_zero = _flat_zeros_like_tangent_prototype(
+            prototype, tangent_meta, prototype_objects
+        )
+        self.assertEqual(len(flat_zero), 2)
+        self.assertEqual(flat_zero[0], torch.zeros_like(flat_zero[0]))
+        self.assertEqual(flat_zero[1], torch.zeros_like(flat_zero[1]))
+
+        del flat_zero, out, unused
+        gc.collect()
+        self.assertTrue(a_storage.expired())
+        self.assertTrue(b_storage.expired())
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_grad_output_prototypes_coerce_subclass_memory_format(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _flat_zeros_like_tangent_prototype,
+        )
+
+        @torch.compile(backend="aot_eager")
+        def fn(x):
+            return x.t().clone(memory_format=torch.preserve_format), x.sin()
+
+        x = TwoTensor(torch.randn(2, 3), torch.randn(2, 3)).requires_grad_()
+        out, _ = fn(x)
+        self.assertEqual(out.a.stride(), (1, 3))
+        ctx = out.grad_fn
+        tangent_meta = ctx._forward_cls.metadata.subclass_tangent_meta[0]
+        flat_zero = _flat_zeros_like_tangent_prototype(
+            ctx._aot_grad_output_prototypes[0],
+            tangent_meta,
+            ctx._aot_grad_output_prototype_objects,
+        )
+        self.assertEqual([value.stride() for value in flat_zero], [(2, 1), (2, 1)])
+
+    def test_grad_output_prototypes_preserve_sparse_layout_structure(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _grad_output_prototype,
+            _zeros_like_tangent_prototype,
+        )
+        from torch._functorch._aot_autograd.schemas import PlainTensorMeta
+
+        tangent_meta = PlainTensorMeta(0)
+        coo = torch.sparse_coo_tensor(torch.tensor([[0, 2]]), torch.randn(2, 3), (4, 3))
+        csr = torch.sparse_csr_tensor(
+            torch.tensor([0, 1, 1, 2, 2]),
+            torch.tensor([0, 2]),
+            torch.randn(2, 3),
+            (4, 3, 3),
+        )
+        bsr = torch.sparse_bsr_tensor(
+            torch.tensor([0, 1, 1]),
+            torch.tensor([0]),
+            torch.randn(1, 2, 2),
+            (4, 4),
+        )
+
+        for value in (coo, csr, bsr):
+            prototype_objects = []
+            prototype = _grad_output_prototype(value, tangent_meta, prototype_objects)
+            self.assertTrue(
+                all(obj.layout is torch.strided for obj in prototype_objects)
+            )
+            zero = _zeros_like_tangent_prototype(
+                prototype, tangent_meta, prototype_objects
+            )
+            self.assertEqual(zero.layout, value.layout)
+            self.assertEqual(zero.shape, value.shape)
+            self.assertEqual(zero._nnz(), 0)
+            if value.layout is torch.sparse_coo:
+                self.assertEqual(zero.sparse_dim(), value.sparse_dim())
+                self.assertEqual(zero.dense_dim(), value.dense_dim())
+            elif value.layout is torch.sparse_bsr:
+                self.assertEqual(zero.values().shape[1:], (2, 2))
+            else:
+                self.assertEqual(zero.dense_dim(), value.dense_dim())
+
+    def test_sparse_grad_output_prototypes_do_not_retain_storage(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _grad_output_prototype,
+        )
+        from torch._functorch._aot_autograd.schemas import PlainTensorMeta
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        def make_prototype():
+            value = torch.sparse_bsr_tensor(
+                torch.tensor([0, 1, 1]),
+                torch.tensor([0]),
+                torch.randn(1, 2, 2),
+                (4, 4),
+            )
+            storages = [
+                StorageWeakRef(tensor.untyped_storage())
+                for tensor in (
+                    value.crow_indices(),
+                    value.col_indices(),
+                    value.values(),
+                )
+            ]
+            prototype_objects = []
+            prototype = _grad_output_prototype(
+                value, PlainTensorMeta(0), prototype_objects
+            )
+            return prototype, prototype_objects, storages
+
+        prototype, prototype_objects, storages = make_prototype()
+        gc.collect()
+        self.assertIsNotNone(prototype)
+        self.assertEqual(prototype_objects, [])
+        self.assertTrue(all(storage.expired() for storage in storages))
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_grad_output_prototypes_preserve_jagged_structure(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _flat_zeros_like_tangent_prototype,
+        )
+        from torch.nested._internal.nested_tensor import nested_view_from_values_offsets
+
+        @torch.compile(backend="aot_eager")
+        def fn(x, y):
+            return x.sin(), y.sin()
+
+        offsets = torch.tensor([0, 2, 5, 6])
+        x = nested_view_from_values_offsets(
+            torch.randn(6, 3, requires_grad=True), offsets
+        )
+        y = nested_view_from_values_offsets(
+            torch.randn(6, 3, requires_grad=True), offsets
+        )
+        out, _ = fn(x, y)
+        ctx = out.grad_fn
+        tangent_meta = ctx._forward_cls.metadata.subclass_tangent_meta[1]
+        prototype = ctx._aot_grad_output_prototypes[1]
+        flat_zero = _flat_zeros_like_tangent_prototype(
+            prototype, tangent_meta, ctx._aot_grad_output_prototype_objects
+        )
+
+        self.assertEqual(flat_zero[0], torch.zeros_like(flat_zero[0]))
+        self.assertEqual(flat_zero[1], offsets)
+        self.assertNotEqual(
+            flat_zero[1].untyped_storage().data_ptr(),
+            offsets.untyped_storage().data_ptr(),
+        )
+
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        with fake_mode:
+            fake_objects = tuple(
+                fake_mode.from_tensor(obj) if isinstance(obj, torch.Tensor) else obj
+                for obj in ctx._aot_grad_output_prototype_objects
+            )
+            fake_flat_zero = _flat_zeros_like_tangent_prototype(
+                prototype, tangent_meta, fake_objects
+            )
+            self.assertTrue(
+                all(value.fake_mode is fake_mode for value in fake_flat_zero)
+            )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_pruned_runtime_args_release_storage_on_cache_hit(self):
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        current_storage = [None]
+        storage_observations = []
+        compiled_graphs = []
+
+        def bw_compiler(gm, _):
+            compiled_graphs.append(gm)
+
+            def boxed(args):
+                before = current_storage[0].expired()
+                out = gm(*args)
+                args.clear()
+                gc.collect()
+                storage_observations.append((before, current_storage[0].expired()))
+                return out
+
+            boxed._boxed_call = True
+            return boxed
+
+        def fn(x, y):
+            return x.sin(), y.sin()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+        for _ in range(2):
+            x = torch.randn(4, requires_grad=True)
+            y_leaf = torch.randn(4096, requires_grad=True)
+            y = y_leaf * 2
+            out, unused = compiled_fn(x, y)
+            current_storage[0] = StorageWeakRef(y.untyped_storage())
+            del y, unused
+            out.sum().backward()
+            self.assertIsNone(y_leaf.grad)
+
+        self.assertEqual(len(compiled_graphs), 1)
+        self.assertEqual([after for _, after in storage_observations], [True, True])
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_custom_backward_op_not_treated_as_vjp(
+        self,
+    ):
+        # A custom op named *_backward is not an aten VJP: it may be affine in
+        # its grad argument, so it must never be pruned as provably zero.
+        with torch.library._scoped_library("aot_test", "FRAGMENT") as lib:
+            lib.define("affine_backward(Tensor grad, Tensor x) -> Tensor")
+            lib.impl(
+                "affine_backward",
+                lambda grad, x: grad + x,
+                "CompositeExplicitAutograd",
+            )
+            torch.library.register_fake(
+                "aot_test::affine_backward",
+                lambda grad, x: torch.empty_like(x),
+                lib=lib,
+            )
+
+            class Fn(torch.autograd.Function):
+                @staticmethod
+                def forward(ctx, x):
+                    ctx.save_for_backward(x)
+                    return x * 2, x * 3
+
+                @staticmethod
+                def backward(ctx, g0, g1):
+                    (x,) = ctx.saved_tensors
+                    return torch.ops.aot_test.affine_backward(g0, x) + g1 * 3
+
+            def fn(x):
+                return Fn.apply(x)
+
+            x_ref = torch.arange(4.0, requires_grad=True)
+            fn(x_ref)[1].sum().backward()
+            torch._dynamo.reset()
+            x = torch.arange(4.0, requires_grad=True)
+            torch.compile(fn, backend="aot_eager")(x)[1].sum().backward()
+            self.assertEqual(x_ref.grad, torch.tensor([3.0, 4.0, 5.0, 6.0]))
+            self.assertEqual(x.grad, x_ref.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_side_effecting_custom_backward_op_runs(
+        self,
+    ):
+        calls = []
+        with torch.library._scoped_library("aot_test", "FRAGMENT") as lib:
+            lib.define("counting_backward(Tensor grad) -> Tensor")
+
+            def counting_backward(grad):
+                calls.append(tuple(grad.shape))
+                return grad.clone()
+
+            lib.impl(
+                "counting_backward", counting_backward, "CompositeExplicitAutograd"
+            )
+            torch.library.register_fake(
+                "aot_test::counting_backward",
+                lambda grad: torch.empty_like(grad),
+                lib=lib,
+            )
+
+            class Fn(torch.autograd.Function):
+                @staticmethod
+                def forward(ctx, x):
+                    return x * 2, x * 3
+
+                @staticmethod
+                def backward(ctx, g0, g1):
+                    return torch.ops.aot_test.counting_backward(g0) + g1 * 3
+
+            def fn(x):
+                return Fn.apply(x)
+
+            torch._dynamo.reset()
+            x = torch.randn(4, requires_grad=True)
+            torch.compile(fn, backend="aot_eager")(x)[1].sum().backward()
+            self.assertEqual(x.grad, torch.full_like(x, 3.0))
+            self.assertEqual(calls, [(4,)])
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=False)
+    def test_non_differentiable_output_aliasing_differentiable_output(self):
+        # Inductor lowers detach to a no-op and folds h * 1 away, so both
+        # outputs are one tensor object; marking the detached one
+        # non-differentiable must not drag the differentiable one along.
+        def fn(x):
+            h = x * 2
+            return h * 1, h.detach()
+
+        torch._dynamo.reset()
+        x = torch.randn(4, requires_grad=True)
+        a, b = torch.compile(fn, backend="inductor")(x)
+        self.assertTrue(a.requires_grad)
+        self.assertFalse(b.requires_grad)
+        self.assertIsNot(a, b)
+        a.sum().backward()
+        self.assertEqual(x.grad, torch.full_like(x, 2.0))
+
+    def test_prune_unused_outputs_baked_at_compile_time(self):
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def compile_under(flag):
+            with torch._functorch.config.patch(aot_autograd_prune_unused_outputs=flag):
+                compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+                compiled_fn(
+                    torch.randn(4, requires_grad=True),
+                    torch.randn(4, requires_grad=True),
+                )
+            return compiled_fn
+
+        def unused_grad(compiled_fn, baked):
+            x = torch.randn(4, requires_grad=True)
+            y = torch.randn(4, requires_grad=True)
+            out = compiled_fn(x, y)
+            forward_cls = out[0].grad_fn._forward_cls
+            self.assertIs(forward_cls._aot_prune_unused_outputs, baked)
+            out[0].sum().backward()
+            return y.grad
+
+        compiled_off = compile_under(False)
+        compiled_on = compile_under(True)
+        for ambient in (True, False):
+            with torch._functorch.config.patch(
+                aot_autograd_prune_unused_outputs=ambient
+            ):
+                self.assertEqual(unused_grad(compiled_off, False), torch.zeros(4))
+                self.assertIsNone(unused_grad(compiled_on, True))
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_specialize_after_full_backward(self):
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        def sin_count(gm):
+            return sum(
+                node.target is torch.ops.aten.sin.default for node in gm.graph.nodes
+            )
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+        x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+        out = compiled_fn(x, y)
+        (out[0].sum() + out[1].sum()).backward()
+        self.assertEqual(len(bw_graphs), 1)
+        self.assertEqual(sin_count(bw_graphs[0]), 1)
+
+        # The base backward already exists; a new pattern still gets its own
+        # specialized variant instead of running the base with zero tangents.
+        for _ in range(2):
+            x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+            compiled_fn(x, y)[0].sum().backward()
+            self.assertEqual(x.grad, x.cos())
+            self.assertIsNone(y.grad)
+        self.assertEqual(len(bw_graphs), 2)
+        self.assertEqual(sin_count(bw_graphs[1]), 0)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_select_specialized_backward_memoizes(self):
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+        out = compiled_fn(x, y)
+        compiler = out[0].grad_fn._forward_cls._aot_backward_compiler
+        self.assertIsNone(compiler.select_specialized_backward(()))
+        specialization = compiler.select_specialized_backward((1,))
+        self.assertIsInstance(specialization, runtime_wrappers._BackwardSpecialization)
+        self.assertEqual(specialization.mask, 0b10)
+        self.assertEqual(specialization.skip_materialize_indices, (1,))
+        self.assertEqual(specialization.pruned_output_indices, ())
+        # The pruned tangent (last backward placeholder) is not an input.
+        num_placeholders = len(
+            compiler.lazy_backward_info.bw_module.graph.find_nodes(op="placeholder")
+        )
+        self.assertNotIn(num_placeholders - 1, specialization.kept_arg_indices)
+        self.assertIs(compiler.select_specialized_backward((1,)), specialization)
+        out[0].sum().backward()
+        self.assertIsNone(y.grad)
+        self.assertEqual(list(compiler.specialized_compiled_bws), [0b10])
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_specialized_variant_cap(self):
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        bw_graphs = []
+
+        def bw_compiler(gm, _):
+            bw_graphs.append(gm)
+            return gm
+
+        def fn(a, b, c, d, e):
+            return a.sin(), b.sin(), c.sin(), d.sin(), e.sin()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=bw_compiler)
+
+        def run(index):
+            inputs = [torch.randn(4, requires_grad=True) for _ in range(5)]
+            out = compiled_fn(*inputs)
+            out[index].sum().backward()
+            self.assertEqual(inputs[index].grad, inputs[index].cos())
+            self.assertEqual(
+                [inp.grad for i, inp in enumerate(inputs) if i != index], [None] * 4
+            )
+            return out[0].grad_fn._forward_cls._aot_backward_compiler
+
+        with (
+            patch.object(runtime_wrappers, "_MAX_SPECIALIZED_BACKWARDS", 2),
+            patch.object(runtime_wrappers, "warning_once") as warn,
+        ):
+            for index in range(2):
+                run(index)
+            self.assertEqual(len(bw_graphs), 2)
+            warn.assert_not_called()
+            # Beyond the cap the base backward compiles once and serves every
+            # further pattern with zero tangents, masking provably-zero grads.
+            compiler = run(2)
+            self.assertEqual(len(bw_graphs), 3)
+            warn.assert_called_once()
+            run(3)
+            run(0)
+            self.assertEqual(len(bw_graphs), 3)
+        # Mask bit i is set when output i's tangent was undefined.
+        self.assertEqual(
+            {mask: spec is not None for mask, spec in compiler.specializations.items()},
+            {0b11110: True, 0b11101: True, 0b11011: False, 0b10111: False},
+        )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_unused_differentiable_outputs_concurrent_backward_threads(self):
+        import threading
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        compiled_fn = aot_function(fn, fw_compiler=nop, bw_compiler=nop)
+        # Compile the forward here: AOTAutograd's forward compile is not
+        # thread-safe and config patches are thread-local, while the pruning
+        # decision is baked into the compiled function. The threads below race
+        # the base and specialized backward compiles and the retain_graph reset.
+        compiled_fn(
+            torch.randn(4, requires_grad=True), torch.randn(4, requires_grad=True)
+        )
+        errors = []
+
+        def full_backward_retaining_graph():
+            try:
+                for _ in range(8):
+                    x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+                    out = compiled_fn(x, y)
+                    loss = out[0].sum() + out[1].sum()
+                    loss.backward(retain_graph=True)
+                    loss.backward()
+                    self.assertEqual(x.grad, 2 * x.cos())
+                    self.assertEqual(y.grad, -2 * y.sin())
+            except Exception as e:
+                errors.append(e)
+
+        def partial_backward():
+            try:
+                for _ in range(8):
+                    x, y = (torch.randn(4, requires_grad=True) for _ in range(2))
+                    compiled_fn(x, y)[0].sum().backward()
+                    self.assertEqual(x.grad, x.cos())
+                    self.assertIsNone(y.grad)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=full_backward_retaining_graph),
+            threading.Thread(target=partial_backward),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=300)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+
+    def test_grad_output_prototypes_store_plain_sizes(self):
+        from torch._functorch._aot_autograd.runtime_wrappers import (
+            _grad_output_prototype,
+            _grad_output_prototype_size_carriers,
+            _grad_output_prototypes_with_carried_sizes,
+            _zeros_like_tangent_prototype,
+        )
+        from torch._functorch._aot_autograd.schemas import PlainTensorMeta
+
+        value = torch.empty_strided((2, 3), (1, 2))
+        objects = []
+        prototype = _grad_output_prototype(value, PlainTensorMeta(0), objects)
+        self.assertEqual(objects, [])
+        self.assertEqual(prototype.size, (2, 3))
+        self.assertEqual(prototype.stride, (1, 2))
+        zero = _zeros_like_tangent_prototype(prototype, PlainTensorMeta(0), objects)
+        self.assertEqual(zero, torch.zeros(2, 3))
+        self.assertEqual(zero.stride(), (1, 2))
+
+        carriers = _grad_output_prototype_size_carriers([prototype])
+        self.assertEqual([c.shape for c in carriers], [(0, 2), (0, 3), (0, 1), (0, 2)])
+        self.assertEqual(
+            _grad_output_prototypes_with_carried_sizes([prototype], carriers),
+            (prototype,),
+        )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_grad_output_size_carriers_only_under_compiled_autograd(self):
+        from torch._dynamo import compiled_autograd
+
+        def fn(x):
+            return x.sin(), x.cos()
+
+        def prototype_objects():
+            out, _ = torch.compile(fn, backend="aot_eager")(
+                torch.randn(4, requires_grad=True)
+            )
+            return out.grad_fn._aot_grad_output_prototype_objects
+
+        torch._dynamo.reset()
+        self.assertEqual(prototype_objects(), ())
+        # torch._dynamo.reset() also resets compiled autograd, so enable after it.
+        torch._dynamo.reset()
+        with (
+            compiled_autograd._enable(lambda gm: gm),
+            torch.autograd.set_multithreading_enabled(False),
+        ):
+            self.assertEqual(
+                [c.shape for c in prototype_objects()], [(0, 4), (0, 1), (0, 4), (0, 1)]
+            )
+
     def test_nested_subclasses(self):
         @torch.compile(backend="aot_eager")
         def f(x):
@@ -9467,6 +10981,157 @@ def forward(self, primals_1, tangents_1):
         actual = self._run_with_compiled_autograd(run)
         self.assertEqual(actual, expected)
 
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_backward_epilogue_compiled_autograd_unused_output(self):
+        @torch.compile(backend="aot_eager")
+        def f(x, y):
+            return x.sin(), y.sin()
+
+        x_base = torch.randn(4)
+        y_base = torch.randn(4)
+
+        def run(x_base, y_base):
+            x = x_base.detach().clone().requires_grad_()
+            y = y_base.detach().clone().requires_grad_()
+            out0, out1 = f(x, y)
+            out0.sum().backward()
+            self.assertIsNone(y.grad)
+            return x.grad, y.grad
+
+        expected = run(x_base, y_base)
+        torch._dynamo.reset()
+        actual = self._run_with_compiled_autograd(lambda: run(x_base, y_base))
+        self.assertEqual(actual, expected)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_compiled_autograd_custom_backward_observes_none_tangent(self):
+        class Fn(torch.autograd.Function):
+            @staticmethod
+            def forward(x, y):
+                return x * 2, y * 3
+
+            @staticmethod
+            def setup_context(ctx, inputs, output):
+                ctx.set_materialize_grads(False)
+                ctx.save_for_backward(*inputs)
+
+            @staticmethod
+            def backward(ctx, grad_x, grad_y):
+                x, y = ctx.saved_tensors
+                if grad_y is None:
+                    return grad_x * x, x * 7
+                return grad_x * x, grad_y * y
+
+        @torch._dynamo.allow_in_graph
+        def opaque(x, y):
+            return Fn.apply(x, y)
+
+        @torch.compile(backend="aot_eager", fullgraph=True)
+        def compiled(x, y):
+            return opaque(x, y)
+
+        x_base = torch.randn(4)
+        y_base = torch.randn(4)
+
+        def run():
+            x = x_base.detach().clone().requires_grad_()
+            y = y_base.detach().clone().requires_grad_()
+            compiled(x, y)[0].sum().backward()
+            return x.grad, y.grad
+
+        expected = (x_base, x_base * 7)
+        actual = self._run_with_compiled_autograd(run)
+        self.assertEqual(actual, expected)
+
+    def test_compiled_autograd_unused_mutated_input_output(self):
+        @torch.compile(backend="aot_eager")
+        def f(x, y):
+            x.mul_(2)
+            return y.sin(), x.cos()
+
+        def run():
+            x_leaf = torch.randn(4, requires_grad=True)
+            x = x_leaf + 0
+            y = torch.randn(4, requires_grad=True)
+            f(x, y)[0].sum().backward()
+            self.assertEqual(x_leaf.grad, torch.zeros_like(x_leaf))
+            self.assertIsNotNone(y.grad)
+
+        run()
+        torch._dynamo.reset()
+        self._run_with_compiled_autograd(run)
+
+    def test_compiled_autograd_runtime_grad_output_prototypes(self):
+        @torch.compile(backend="aot_eager", dynamic=True)
+        def f(x):
+            # repeat_backward contains an unsupported zero-propagation sum, so
+            # the missing second tangent must be materialized at runtime.
+            return x.sin(), x.repeat(2, 1)
+
+        def run(size):
+            x = torch.randn(size, requires_grad=True)
+            expected = x.cos().detach()
+            out, _ = f(x)
+            lazy_info = out.grad_fn._forward_cls._lazy_backward_info
+            lazy_info.autograd_trace_info = None
+            out.sum().backward()
+            self.assertEqual(x.grad, expected)
+
+        compiled_autograd_graphs = []
+
+        def compiler_fn(gm):
+            compiled_autograd_graphs.append(gm)
+            return torch.compile(gm, backend="aot_eager", fullgraph=True, dynamic=True)
+
+        self._run_with_compiled_autograd(
+            lambda: (run(4), run(7)), compiler_fn=compiler_fn
+        )
+        self.assertEqual(len(compiled_autograd_graphs), 1)
+        self.assertIn(
+            torch.ops.aten.sum.dim_IntList,
+            [node.target for node in compiled_autograd_graphs[0].graph.nodes],
+        )
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_compiled_autograd_unresolved_none_tangent_diagnostic(self):
+        import torch._functorch._aot_autograd.graph_compile as graph_compile
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+        from torch._dynamo import compiled_autograd
+
+        def fn(x):
+            y = torch.sin(x)
+            return y[0:4], y[4:8], y.detach(), x * 3
+
+        torch._dynamo.reset()
+        x = torch.arange(8, dtype=torch.float32).requires_grad_(True)
+        with (
+            patch.object(
+                runtime_wrappers, "_dealias_marked_returns", lambda raw, marked: None
+            ),
+            patch.object(
+                graph_compile,
+                "_retrace_backward_for_undefined_grad_outputs",
+                lambda *args, **kwargs: None,
+            ),
+            patch.object(
+                runtime_wrappers,
+                "_specialize_bw_module_for_undefined_grad_outputs",
+                lambda *args, **kwargs: None,
+            ),
+            patch.object(
+                runtime_wrappers, "_grad_output_prototype", lambda *args, **kwargs: None
+            ),
+        ):
+            outputs = torch.compile(fn, backend="aot_eager")(x)
+            with (
+                compiled_autograd._enable(lambda gm: gm),
+                torch.autograd.set_multithreading_enabled(False),
+                self.assertRaisesRegex(
+                    RuntimeError, "handed a non-Tensor for a tangent it requires"
+                ),
+            ):
+                outputs[3].sum().backward()
+
     def test_backward_epilogue_compiled_autograd_subclass(self):
         from torch.testing._internal.two_tensor import TwoTensor
 
@@ -9488,6 +11153,39 @@ def forward(self, primals_1, tangents_1):
         actual = self._run_with_compiled_autograd(run)
         self.assertEqual(actual[0], expected[0])
         self.assertEqual(actual[1], expected[1])
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_backward_epilogue_compiled_autograd_subclass_fallback(self):
+        @torch.compile(backend="aot_eager", dynamic=True)
+        def f(x, y):
+            # Dynamic shapes add SymInt arguments between the subclass tensor
+            # leaves that the backward epilogue must group together.
+            return x.sin(), y.repeat(2, 1)
+
+        def run(size):
+            x = TwoTensor(torch.randn(size), torch.randn(size)).requires_grad_()
+            y = TwoTensor(torch.randn(size), torch.randn(size)).requires_grad_()
+            f(x, y)[0].sum().backward()
+            self.assertIsInstance(x.grad, TwoTensor)
+            self.assertEqual(x.grad.a, x.a.cos())
+            self.assertEqual(x.grad.b, x.b.cos())
+            # repeat's backward sums the tangent, which zero-propagation does
+            # not handle, so the unused grad is materialized as zeros rather
+            # than pruned to None.
+            self.assertIsInstance(y.grad, TwoTensor)
+            self.assertEqual(y.grad.a, torch.zeros(size))
+            self.assertEqual(y.grad.b, torch.zeros(size))
+
+        compiled_autograd_graphs = []
+
+        def compiler_fn(gm):
+            compiled_autograd_graphs.append(gm)
+            return torch.compile(gm, backend="aot_eager", fullgraph=True, dynamic=True)
+
+        self._run_with_compiled_autograd(
+            lambda: (run(4), run(7)), compiler_fn=compiler_fn
+        )
+        self.assertEqual(len(compiled_autograd_graphs), 1)
 
     # --- AOTSyntheticBaseWrapper codegen tests ---
 
@@ -12631,6 +14329,121 @@ instantiate_device_type_tests(
 )
 instantiate_device_type_tests(TestEagerFusionOpInfo, globals(), only_for=only_for)
 instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for=only_for)
+
+
+class TestAOTAutogradPruneUnusedOutputsInductor(AOTTestCase):
+    """Undefined-tangent backward specialization through inductor on every device."""
+
+    def _retrace_must_succeed(self):
+        import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
+
+        def unexpected_fallback(*args, **kwargs):
+            self.fail("the backward retrace should have specialized this pattern")
+
+        stack = ExitStack()
+        for name in (
+            "_specialize_bw_module_for_undefined_grad_outputs",
+            "_materialize_missing_tangent_args",
+        ):
+            stack.enter_context(
+                patch.object(runtime_wrappers, name, unexpected_fallback)
+            )
+        return stack
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_retrace_with_dropout(self, device):
+        # The backward-time retrace runs the inductor partition_fn, whose RNG
+        # replacement passes need inductor's virtualized fake mode.
+        def fn(x, y):
+            return torch.nn.functional.dropout(x.sin(), p=0.5, training=True), y.cos()
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="inductor")
+        x = torch.randn(8, device=device, requires_grad=True)
+        y = torch.randn(8, device=device, requires_grad=True)
+        out = compiled_fn(x, y)
+        with self._retrace_must_succeed():
+            out[0].sum().backward()
+        self.assertIsNotNone(x.grad)
+        self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(
+        aot_autograd_prune_unused_outputs=True, force_non_lazy_backward_lowering=True
+    )
+    def test_retrace_after_eager_backward_lowering_with_cache(self, device):
+        # Eager backward lowering with the AOT cache on serializes the live
+        # backward module, stripping node.meta; the retrace must still match
+        # its placeholders (via the keys snapshotted at compile time).
+        from torch._inductor.utils import fresh_cache
+
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        with fresh_cache():
+            torch._dynamo.reset()
+            compiled_fn = torch.compile(fn, backend="inductor")
+            x = torch.randn(5, device=device, requires_grad=True)
+            y = torch.randn(5, device=device, requires_grad=True)
+            out = compiled_fn(x, y)
+            with self._retrace_must_succeed():
+                out[0].sum().backward()
+        self.assertEqual(x.grad, x.cos())
+        self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_retrace_dynamic_shapes(self, device):
+        def fn(x, y):
+            return torch.nn.functional.layer_norm(x, [x.shape[-1]]), y.cos()
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="inductor", dynamic=True)
+        for size in (4, 7):
+            x_ref = torch.randn(size, 3, device=device, requires_grad=True)
+            y_ref = torch.randn(size, device=device, requires_grad=True)
+            x = x_ref.detach().clone().requires_grad_()
+            y = y_ref.detach().clone().requires_grad_()
+            fn(x_ref, y_ref)[0].sum().backward()
+            out = compiled_fn(x, y)
+            with self._retrace_must_succeed():
+                out[0].sum().backward()
+            self.assertEqual(x.grad, x_ref.grad)
+            self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_autograd_grad_allow_unused(self, device):
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="inductor")
+        x = torch.randn(4, device=device, requires_grad=True)
+        y = torch.randn(4, device=device, requires_grad=True)
+        out = compiled_fn(x, y)
+        grads = torch.autograd.grad(out[0].sum(), (x, y), allow_unused=True)
+        self.assertEqual(grads[0], x.cos())
+        self.assertIsNone(grads[1])
+        self.assertIsNone(x.grad)
+        self.assertIsNone(y.grad)
+
+    @torch._functorch.config.patch(aot_autograd_prune_unused_outputs=True)
+    def test_double_backward_with_undefined_tangent_raises(self, device):
+        def fn(x, y):
+            return x.sin(), y.cos()
+
+        torch._dynamo.reset()
+        compiled_fn = torch.compile(fn, backend="inductor")
+        x = torch.randn(4, device=device, requires_grad=True)
+        y = torch.randn(4, device=device, requires_grad=True)
+        out = compiled_fn(x, y)
+        (gx,) = torch.autograd.grad(out[0].sum(), x, create_graph=True)
+        self.assertEqual(gx, x.cos())
+        with self.assertRaisesRegex(
+            RuntimeError, "does not currently support double backward"
+        ):
+            gx.sum().backward()
+
+
+instantiate_device_type_tests(TestAOTAutogradPruneUnusedOutputsInductor, globals())
 
 
 @xfail_inherited_tests(

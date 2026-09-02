@@ -196,6 +196,23 @@ def call(args):
         with self.assertRaises(NoRunnableInductorModuleError):
             compile_to_python(gm, _flat_inputs(m, x))
 
+    def test_backward_flag_forwarded_to_compile_fx_inner(self):
+        from torch._inductor import compile_fx
+
+        m = _Pointwise().eval()
+        x = torch.randn(5, 4)
+        gm = _capture(m, x)
+        with mock.patch.object(
+            compile_fx, "compile_fx_inner", wraps=compile_fx.compile_fx_inner
+        ) as inner_compile:
+            compile_to_python(
+                gm,
+                _flat_inputs(m, x),
+                is_inference=False,
+                is_backward=True,
+            )
+        self.assertTrue(inner_compile.call_args.kwargs["is_backward"])
+
 
 @requires_cuda_and_triton
 class TestInductorCompileToPythonCudaCodegen(TestCase):
@@ -464,6 +481,23 @@ class TestInductorCompileToPythonContract(TestCase):
         # Warm: the cache accelerates the same module; result is identical.
         with fresh_cache(), torch.no_grad():
             self.assertEqual(load_from_python(src, cache)(_flat_inputs(m, x))[0], m(x))
+
+    def test_passthrough_source_renders_nonfinite_floats(self):
+        # repr(float("inf")) is "inf", which is not valid Python source; the
+        # passthrough renderer must spell nonfinite floats as float(...) calls.
+        import math
+
+        from torch._inductor.standalone_compile import _passthrough_source
+
+        gm = torch.fx.symbolic_trace(lambda x: (x, float("inf"), float("nan")))
+        source = _passthrough_source(gm)
+        namespace = {}
+        exec(source, namespace)
+        x = torch.randn(2)
+        out = namespace["call"]([x])
+        self.assertIs(out[0], x)
+        self.assertEqual(out[1], float("inf"))
+        self.assertTrue(math.isnan(out[2]))
 
     def test_no_cache_when_caches_disabled(self):
         # With caches disabled there is no saveable artifact, so cache is None; the source

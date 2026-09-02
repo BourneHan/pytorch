@@ -1,23 +1,26 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import dataclasses
 import dis
+import enum
 import functools
 import inspect
+import keyword
 import logging
+import math
 import operator
 import os
 import re
 import secrets
 import sys
 import tempfile
-from collections.abc import Callable
-from enum import Enum
+from collections.abc import Callable, Iterable
 from itertools import chain, count
-from typing import Any, Literal, Protocol, TYPE_CHECKING
+from typing import Any, cast, Literal, NoReturn, Protocol, TYPE_CHECKING
 
 import sympy
 from sympy import Expr
@@ -31,7 +34,7 @@ from torch._inductor.codegen.debug_utils import DebugPrinterManager
 from torch._inductor.codegen.multi_kernel import MultiKernelState
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch._library.opaque_object import get_opaque_obj_repr, is_opaque_constant_type
-from torch._logging import trace_structured
+from torch._logging import trace_structured, warning_once
 from torch.fx.experimental.proxy_tensor import (
     _coor_check_current_accelerator,
     _coor_current_accelerator,
@@ -68,9 +71,7 @@ from ..utils import (
     DeferredLineBase,
     DelayReplaceLine,
     get_benchmark_name,
-    get_constexpr_repr_children,
     get_dtype_size,
-    get_importable_constexpr_types,
     IndentedBuffer,
     is_codegen_graph_partition_subgraph,
     is_using_cudagraph_partition,
@@ -96,7 +97,7 @@ from .triton_utils import config_of, should_unwrap_unspec_arg, signature_to_meta
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Iterator, Sequence
 
     import triton
 
@@ -119,21 +120,624 @@ def _rewrite_symbol_solution_for_int_codegen(expr: sympy.Expr) -> sympy.Expr:
     return CleanDiv(numerator, denominator)
 
 
-def _sanitize_for_repr(obj: Any) -> Any:
-    """Convert Enum values to their underlying value for valid Python repr in code generation."""
-    if isinstance(obj, Enum):
-        return _sanitize_for_repr(obj.value)
-    repr_children = get_constexpr_repr_children(obj)
-    if repr_children is not None:
-        children = tuple(_sanitize_for_repr(child) for child in repr_children.values)
-        # Rebuilding arbitrary attrs, pydantic, and container subclasses can
-        # invoke user code, so preserve the original when sanitization is a no-op.
-        if all(
-            child is original for child, original in zip(children, repr_children.values)
+def _enum_member_interchangeable(value: enum.Enum) -> bool:
+    # IntEnum/IntFlag/str-mixin members compare and hash like their values, so
+    # baking the value is exact.
+    if not isinstance(value.value, (bytes, float, int, str)):
+        return False
+    try:
+        return value == value.value and hash(value) == hash(value.value)
+    except TypeError:
+        return False
+
+
+def _importable_type_path(cls: type[Any]) -> tuple[str, str] | None:
+    """Return ``(module, qualname)`` when ``import module`` followed by the
+    ``qualname`` attribute chain yields exactly ``cls`` in this process, else
+    None (classes from ``__main__``, local scopes, or not bound under their own
+    name). ``sys.modules`` is the reference, so spec-less modules registered by
+    hand import fine; async-compile workers that cannot import the module fall
+    back to in-process compilation (see async_compile.py)."""
+    module, qualname = cls.__module__, cls.__qualname__
+    if not module or module == "__main__":
+        return None
+    path = [*module.split("."), *qualname.split(".")]
+    if not all(part.isidentifier() and not keyword.iskeyword(part) for part in path):
+        return None
+    resolved: Any = sys.modules.get(module)
+    try:
+        for part in qualname.split("."):
+            resolved = getattr(resolved, part)
+    except AttributeError:
+        return None
+    return (module, qualname) if resolved is cls else None
+
+
+class _EnumRendering(enum.Enum):
+    """How an Enum constexpr reaches the generated kernel."""
+
+    # Interchangeable mixin member, or config.triton.unwrap_plain_enum_constexpr.
+    VALUE = "value"
+    # Plain member of a class the generated module cannot import: its value is
+    # baked with a warning rather than failing the compile.
+    UNIMPORTABLE_VALUE = "unimportable_value"
+    MEMBER = "member"
+
+
+def _enum_rendering(value: enum.Enum) -> _EnumRendering:
+    if _enum_member_interchangeable(value) or config.triton.unwrap_plain_enum_constexpr:
+        return _EnumRendering.VALUE
+    if _importable_type_path(type(value)) is None:
+        return _EnumRendering.UNIMPORTABLE_VALUE
+    return _EnumRendering.MEMBER
+
+
+def _constexpr_constant(value: Any, unwrapped: list[enum.Enum] | None = None) -> Any:
+    # Normalizes a constexpr value to what the generated kernel bakes in, so the
+    # kernel metas (triton_meta constants, autotune configs) agree with the
+    # rendered source: Enum members that render as values are unwrapped, and
+    # exact builtin containers are rebuilt over normalized items. Subclasses
+    # pass through unchanged for _ConstexprRenderer to spell or decline. Plain
+    # members unwrapped because their class is not importable are appended to
+    # `unwrapped` when given, for the caller's warning.
+    if type(value) is dict:
+        return {
+            _constexpr_constant(key, unwrapped): _constexpr_constant(item, unwrapped)
+            for key, item in value.items()
+        }
+    if type(value) is list:
+        return [_constexpr_constant(item, unwrapped) for item in value]
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        make = getattr(type(value), "_make")  # noqa: B009
+        return make(_constexpr_constant(item, unwrapped) for item in value)
+    if type(value) is torch.Size:
+        # torch.Size is a value-transparent torch container (no _fields;
+        # iteration/__eq__ inherited from tuple), so a plain tuple is exact.
+        return tuple(_constexpr_constant(item, unwrapped) for item in value)
+    if type(value) is tuple:
+        return tuple(_constexpr_constant(item, unwrapped) for item in value)
+    if isinstance(value, enum.Enum):
+        rendering = _enum_rendering(value)
+        if rendering is _EnumRendering.MEMBER:
+            return value
+        if rendering is _EnumRendering.UNIMPORTABLE_VALUE and unwrapped is not None:
+            unwrapped.append(value)
+        return _constexpr_constant(value.value, unwrapped)
+    return value
+
+
+def _normalize_constexpr_mapping(
+    mapping: dict[str, Any], kernel_name: str
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for name, value in mapping.items():
+        unwrapped: list[enum.Enum] = []
+        normalized[name] = _constexpr_constant(value, unwrapped)
+        _warn_enum_constexpr_renderings(kernel_name, name, unwrapped, [])
+    return normalized
+
+
+def _constexpr_constructor_items(value: Any) -> list[tuple[str | None, Any]] | None:
+    # Dataclasses, attrs-like classes and __repr_args__ (pydantic-like) objects
+    # rebuild as TypeRef(field=child, ...) over their repr-visible fields.
+    if isinstance(value, type):
+        return None
+    if dataclasses.is_dataclass(value):
+        fields = dataclasses.fields(value)
+        return [(f.name, getattr(value, f.name)) for f in fields if f.repr]
+    attrs_fields = getattr(type(value), "__attrs_attrs__", None)
+    if attrs_fields is not None:
+        # attrs permits callable repr formatters, so only False hides a field.
+        return [
+            (field.name, getattr(value, field.name))
+            for field in attrs_fields
+            if getattr(field, "repr", True) is not False
+        ]
+    repr_args = getattr(value, "__repr_args__", None)
+    if callable(repr_args):
+        pairs = cast(Callable[[], Iterable[tuple[object, object]]], repr_args)()
+        items: list[tuple[str | None, Any]] = []
+        for name, item in pairs:
+            if name is not None and not isinstance(name, str):
+                return None
+            items.append((name, item))
+        return items
+    return None
+
+
+def _triton_constexpr_type() -> type[Any] | None:
+    try:
+        from triton.language import constexpr
+    except ImportError:
+        return None
+    return constexpr
+
+
+class _ConstexprUnrenderable(Exception):
+    """Raised inside _ConstexprRenderer when a value has no faithful spelling;
+    _raise_constexpr_error turns it into the user-facing error."""
+
+    def __init__(self, reason: str, unimportable_type: type[Any] | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.unimportable_type = unimportable_type
+
+
+class _ConstexprRenderer:
+    """Spells constexpr values as Python source the generated kernel module can
+    evaluate. Builtin literals stay literals; everything else is reached through
+    ``import <module> as __inductor_constexpr_module_N`` aliases, and each
+    top-level rendering is verified by evaluating it (executing user
+    constructors once per object) and comparing the rebuilt value with the
+    original, so state-losing reprs decline loudly at codegen instead of
+    miscomputing in the generated kernel."""
+
+    def __init__(self) -> None:
+        self.module_aliases: dict[str, str] = {}
+        self.imports: list[str] = []
+        # ids of the values currently being spelled: a self-referential value
+        # cannot be written as an expression.
+        self._stack: OrderedSet[int] = OrderedSet()
+        # Plain Enum members met while spelling, taken per constexpr for the
+        # caller's warnings: unwrapped to their values because their class is
+        # not importable, or baked as members.
+        self.unwrapped_members: list[enum.Enum] = []
+        self.baked_members: list[enum.Enum] = []
+
+    def take_enum_members(self) -> tuple[list[enum.Enum], list[enum.Enum]]:
+        unwrapped, baked = self.unwrapped_members, self.baked_members
+        self.unwrapped_members, self.baked_members = [], []
+        return unwrapped, baked
+
+    def render(self, value: Any) -> str:
+        source = self._source(value)
+        namespace = {
+            alias: sys.modules.get(module)
+            for module, alias in self.module_aliases.items()
+        }
+        try:
+            rebuilt = eval(source, namespace)
+        except Exception as e:
+            raise _ConstexprUnrenderable(
+                f"evaluating its rendered source {source} raised {e!r}"
+            ) from e
+        if not _constexpr_values_match(value, rebuilt):
+            raise _ConstexprUnrenderable(
+                f"rebuilding it from its rendered source {source} gives {rebuilt!r}, "
+                "which does not reproduce the original; make the repr-visible "
+                "fields fully determine the object"
+            )
+        return source
+
+    def module_ref(self, module: str) -> str:
+        if module not in self.module_aliases:
+            alias = f"__inductor_constexpr_module_{len(self.module_aliases)}"
+            self.module_aliases[module] = alias
+            self.imports.append(f"import {module} as {alias}")
+        return self.module_aliases[module]
+
+    def _type_ref(self, cls: type[Any]) -> str:
+        path = _importable_type_path(cls)
+        if path is None:
+            raise _ConstexprUnrenderable(
+                f"its type {cls.__module__}.{cls.__qualname__} cannot be imported "
+                "by the generated module; define it at module scope in an "
+                "importable module",
+                unimportable_type=cls,
+            )
+        module, qualname = path
+        return f"{self.module_ref(module)}.{qualname}"
+
+    def _constructor_call(self, value: Any) -> tuple[str, str]:
+        # Container subclasses and plain classes render as a call of their
+        # aliased type only when their repr already reads as one, which
+        # signals the constructor accepts what the repr shows. Returns the type
+        # reference and the repr's argument text.
+        cls = type(value)
+        source = repr(value)
+        for name in (cls.__qualname__, cls.__name__):
+            if source.startswith(f"{name}(") and source.endswith(")"):
+                return self._type_ref(cls), source[len(name) :]
+        raise _ConstexprUnrenderable(
+            f"its type {cls.__module__}.{cls.__qualname__} has no constructor-style "
+            f"repr (got {source[:60]!r}); give it a repr reading "
+            f"{cls.__qualname__}(...) that rebuilds it"
+        )
+
+    def _source(self, value: Any) -> str:
+        if id(value) in self._stack:
+            raise _ConstexprUnrenderable("it is self-referential")
+        self._stack.add(id(value))
+        try:
+            return self._node(value)
+        finally:
+            self._stack.discard(id(value))
+
+    def _items(self, values: Iterable[Any]) -> str:
+        return ", ".join(self._source(item) for item in values)
+
+    def _attribute_ref(self, value: Any, source: str) -> str | None:
+        # reprs that read as a dotted path (torch.float32, torch.strided,
+        # triton.language.float16) render through the longest imported module
+        # prefix whose attribute chain yields this exact object.
+        parts = source.split(".")
+        if len(parts) < 2 or not all(part.isidentifier() for part in parts):
+            return None
+        for split in range(len(parts) - 1, 0, -1):
+            module = ".".join(parts[:split])
+            resolved: Any = sys.modules.get(module)
+            if resolved is None:
+                continue
+            try:
+                for part in parts[split:]:
+                    resolved = getattr(resolved, part)
+            except AttributeError:
+                continue
+            if resolved is value:
+                return f"{self.module_ref(module)}.{'.'.join(parts[split:])}"
+        return None
+
+    def _node(self, value: Any) -> str:
+        if isinstance(value, ir.IRNode):
+            raise _ConstexprUnrenderable(
+                "it is a tensor at compile time (a 0-d tensor or NumPy scalar "
+                "lifted to a graph input), not a Python constant; pass a Python "
+                "int, float, str or bool"
+            )
+        if isinstance(value, enum.Enum):
+            rendering = _enum_rendering(value)
+            if rendering is _EnumRendering.UNIMPORTABLE_VALUE:
+                self.unwrapped_members.append(value)
+            if rendering is not _EnumRendering.MEMBER:
+                return self._source(value.value)
+            self.baked_members.append(value)
+            cls = type(value)
+            cls_ref = self._type_ref(cls)
+            if value.name is not None and cls.__members__.get(value.name) is value:
+                return f"{cls_ref}[{value.name!r}]"
+            # Flag composites have no member to look up; the class call
+            # recovers them from the value.
+            return f"{cls_ref}({self._source(value.value)})"
+        if isinstance(value, torch.device):
+            index = "" if value.index is None else f", index={value.index!r}"
+            return f"{self.module_ref('torch')}.device(type={value.type!r}{index})"
+        if isinstance(value, dict):
+            display = (
+                "{"
+                + ", ".join(
+                    f"{self._source(key)}: {self._source(item)}"
+                    for key, item in value.items()
+                )
+                + "}"
+            )
+            if type(value) is dict:
+                return display
+            return f"{self._constructor_call(value)[0]}({display})"
+        if isinstance(value, list):
+            display = f"[{self._items(value)}]"
+            if type(value) is list:
+                return display
+            return f"{self._constructor_call(value)[0]}({display})"
+        if isinstance(value, tuple):
+            if type(value) is torch.Size:
+                return self._source(_constexpr_constant(value))
+            body = self._items(value) + ("," if len(value) == 1 else "")
+            if hasattr(value, "_fields"):
+                return f"{self._type_ref(type(value))}._make(({body}))"
+            if type(value) is tuple:
+                return f"({body})"
+            return f"{self._constructor_call(value)[0]}([{self._items(value)}])"
+        if isinstance(value, (set, frozenset, OrderedSet)):  # noqa: set_linter
+            if type(value) in (set, frozenset):  # noqa: set_linter
+                # Builtin sets are unordered, so their items are sorted for
+                # deterministic generated source.
+                items = sorted(
+                    value,
+                    key=lambda item: (
+                        type(item).__module__,
+                        type(item).__qualname__,
+                        repr(item),
+                    ),
+                )
+                if isinstance(value, frozenset):
+                    return (
+                        f"frozenset(({self._items(items)},))"
+                        if items
+                        else "frozenset()"
+                    )
+                return "{" + self._items(items) + "}" if items else "set()"
+            if type(value) is OrderedSet:
+                # Insertion-ordered with a list-accepting constructor, so it
+                # reconstructs exactly.
+                return f"{self._type_ref(OrderedSet)}([{self._items(value)}])"
+            raise _ConstexprUnrenderable(
+                f"a {type(value).__qualname__} set subclass has no deterministic "
+                "spelling (only builtin sets and OrderedSet render); pass a builtin "
+                "set or torch.utils._ordered_set.OrderedSet"
+            )
+        if isinstance(value, slice):
+            return f"slice({self._items((value.start, value.stop, value.step))})"
+        if isinstance(value, range):
+            return repr(value)
+        if isinstance(value, bytearray):
+            return f"bytearray({bytes(value)!r})"
+        if type(value) is float and math.isnan(value):
+            raise _ConstexprUnrenderable(
+                "NaN never compares equal, so autotune config matching (which "
+                "compares constants by equality) could not select it"
+            )
+        if type(value) is float and math.isinf(value):
+            return f"float({str(value)!r})"
+        constructor_items = _constexpr_constructor_items(value)
+        if constructor_items is not None:
+            cls_ref = self._type_ref(type(value))
+            parts = [
+                self._source(item) if name is None else f"{name}={self._source(item)}"
+                for name, item in constructor_items
+            ]
+            return f"{cls_ref}({', '.join(parts)})"
+        source = repr(value)
+        try:
+            reconstructed = ast.literal_eval(source)
+            matches = type(reconstructed) is type(value) and reconstructed == value
+        except Exception:
+            # literal_eval also raises TypeError/RecursionError/MemoryError on
+            # pathological reprs; none of them is a literal.
+            pass
+        else:
+            if matches is True:
+                return source
+        attribute_ref = self._attribute_ref(value, source)
+        if attribute_ref is not None:
+            return attribute_ref
+        constexpr_type = _triton_constexpr_type()
+        if constexpr_type is not None and isinstance(value, constexpr_type):
+            module_ref = self.module_ref("triton.language")
+            return f"{module_ref}.constexpr({self._source(value.value)})"
+        if isinstance(value, type):
+            return self._type_ref(value)
+        if type(value).__module__ == "builtins":
+            raise _ConstexprUnrenderable(
+                f"{type(value).__name__} objects have no source spelling; pass an "
+                "int, float, str, bytes, bool, None, or a tuple/list/dict of those"
+            )
+        cls_ref, arguments = self._constructor_call(value)
+        return f"{cls_ref}{arguments}"
+
+
+def _instance_state_match(original: Any, rebuilt: Any) -> bool:
+    # Instance attributes beyond a type's items or fields (a dict subclass
+    # carrying extra state, a plain class) must round-trip too.
+    state = getattr(original, "__dict__", None)
+    if state is None:
+        return True
+    return _constexpr_values_match(state, getattr(rebuilt, "__dict__", None))
+
+
+def _constexpr_values_match(original: Any, rebuilt: Any) -> bool:
+    """Check that a value rebuilt from rendered source is faithful to the
+    original: rebuilding from a constructor-style repr can silently lose state
+    (a repr=False field falling back to its default, a coercing
+    ``__post_init__``, ...), so compare the full enumerable state, not just the
+    type."""
+    original = _constexpr_constant(original)
+    rebuilt = _constexpr_constant(rebuilt)
+    if original is rebuilt:
+        return True
+    if type(rebuilt) is not type(original):
+        return False
+    if dataclasses.is_dataclass(original) and not isinstance(original, type):
+        names = [f.name for f in dataclasses.fields(original)]
+    else:
+        attrs_fields = getattr(type(original), "__attrs_attrs__", None)
+        names = None if attrs_fields is None else [f.name for f in attrs_fields]
+    if names is not None:
+        return all(
+            _constexpr_values_match(getattr(original, name), getattr(rebuilt, name))
+            for name in names
+        )
+    if isinstance(original, dict):
+        return (
+            len(original) == len(rebuilt)
+            and all(
+                _constexpr_values_match(key, rebuilt_key)
+                and _constexpr_values_match(item, rebuilt_item)
+                for (key, item), (rebuilt_key, rebuilt_item) in zip(
+                    original.items(), rebuilt.items()
+                )
+            )
+            and _instance_state_match(original, rebuilt)
+        )
+    if isinstance(original, (list, tuple)):
+        return (
+            len(original) == len(rebuilt)
+            and all(
+                _constexpr_values_match(item, rebuilt_item)
+                for item, rebuilt_item in zip(original, rebuilt)
+            )
+            and _instance_state_match(original, rebuilt)
+        )
+    constexpr_type = _triton_constexpr_type()
+    if constexpr_type is not None and isinstance(original, constexpr_type):
+        return _constexpr_values_match(original.value, rebuilt.value)
+    if type(original).__eq__ is object.__eq__:
+        # Identity-equality objects (plain classes with a constructor-style
+        # repr) compare by their enumerable state instead.
+        return hasattr(original, "__dict__") and _instance_state_match(
+            original, rebuilt
+        )
+    # Otherwise require the type's own equality; anything unequal (or raising,
+    # handled by the caller) declines.
+    return (original == rebuilt) is True
+
+
+def _raise_constexpr_error(
+    kernel_name: str, role: str, value: Any, error: _ConstexprUnrenderable
+) -> NoReturn:
+    cls = type(value)
+    error_type = RuntimeError if error.unimportable_type is None else ImportError
+    raise error_type(
+        f"Triton kernel {kernel_name} constexpr {role} has value {value!r} of type "
+        f"{cls.__module__}.{cls.__qualname__}, which cannot be written into the "
+        f"generated kernel: {error.reason}."
+    ) from None
+
+
+def _warn_enum_constexpr_renderings(
+    kernel_name: str,
+    name: str,
+    unwrapped: list[enum.Enum],
+    baked: list[enum.Enum],
+) -> None:
+    for member in unwrapped:
+        cls = type(member)
+        warning_once(
+            log,
+            "Triton kernel %s constexpr %r is a member of Enum class %s.%s, which "
+            "the generated kernel module cannot import (it is defined in __main__, "
+            "in a local scope, or in a module not on sys.path), so its value %s is "
+            "baked in instead: the kernel sees that value, not the member "
+            "(%s == %s is true; %s.value and %s.name are unavailable), unlike a "
+            "direct eager launch. Define the Enum in an importable module for "
+            "member fidelity, or use an IntEnum/str-mixin Enum whose members are "
+            "interchangeable with their values.",
+            kernel_name,
+            name,
+            cls.__module__,
+            cls.__qualname__,
+            repr(member.value),
+            name,
+            repr(member.value),
+            name,
+            name,
+        )
+    for member in baked:
+        cls = type(member)
+        warning_once(
+            log,
+            "Triton kernel %s constexpr %r is the plain Enum member %s of %s.%s and "
+            "is baked into the generated kernel as that member; earlier releases "
+            "baked its value %s instead. A kernel written against the old rendering "
+            "(e.g. branching on %s == %s) now takes the other branch: compare "
+            "%s.value instead, or set "
+            "torch._inductor.config.triton.unwrap_plain_enum_constexpr=True to "
+            "restore the previous rendering.",
+            kernel_name,
+            name,
+            repr(member),
+            cls.__module__,
+            cls.__qualname__,
+            repr(member.value),
+            name,
+            repr(member.value),
+            name,
+        )
+
+
+class _SourceLiteral:
+    # Repr'd verbatim into the generated source in place of a value; the
+    # returned/cached kernel metas keep the real values.
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+    def __repr__(self) -> str:
+        return self.source
+
+
+def _render_constexpr_mappings(
+    renderer: _ConstexprRenderer, mappings: list[dict[str, Any]], kernel_name: str
+) -> list[dict[str, Any]]:
+    rendered_mappings: list[dict[str, Any]] = []
+    for constants in mappings:
+        rendered: dict[str, Any] = {}
+        for name, value in constants.items():
+            try:
+                expression = renderer.render(value)
+            except _ConstexprUnrenderable as e:
+                _raise_constexpr_error(kernel_name, f"argument {name!r}", value, e)
+            _warn_enum_constexpr_renderings(
+                kernel_name, name, *renderer.take_enum_members()
+            )
+            rendered[name] = (
+                _SourceLiteral(expression) if expression != repr(value) else value
+            )
+        rendered_mappings.append(rendered)
+    return rendered_mappings
+
+
+def _rewrite_constexpr_defaults(
+    renderer: _ConstexprRenderer, kernel: Any, kernel_src: str, kernel_name: str
+) -> tuple[str, list[str]]:
+    """Bind the constexpr parameter defaults of the kernel def to module-level
+    names holding their rendered values, and return the rewritten source plus
+    the binding lines.
+
+    The generated module re-execs the spliced def, so each default expression is
+    evaluated at def time in a namespace without the user's globals; Triton's
+    code generator then re-evaluates every default expression with its own
+    restricted semantics (literals become constexprs, subscripts and calls run on
+    them). A bare module-level name satisfies both: Python evaluates the rendered
+    value once at import, and Triton dereferences the name. Defaults whose source
+    already is their rendering (plain literals) are left alone."""
+    defaults = {
+        p.name: p.default for p in kernel.params if p.is_constexpr and p.has_default
+    }
+    if not defaults:
+        return kernel_src, []
+    fn_defs = [
+        node
+        for node in ast.parse(kernel_src).body
+        if isinstance(node, ast.FunctionDef) and node.name == kernel.fn.__name__
+    ]
+    if not fn_defs:
+        raise AssertionError(f"kernel def {kernel.fn.__name__} not in its source")
+    args = fn_defs[0].args
+    positional = [*args.posonlyargs, *args.args]
+    default_nodes = [
+        *zip(positional[len(positional) - len(args.defaults) :], args.defaults),
+        *(
+            (arg, node)
+            for arg, node in zip(args.kwonlyargs, args.kw_defaults)
+            if node is not None
+        ),
+    ]
+    # ast positions are (1-based line, UTF-8 byte column).
+    lines = kernel_src.splitlines(keepends=True)
+    line_starts = [0]
+    for line in lines:
+        line_starts.append(line_starts[-1] + len(line))
+
+    def offset(lineno: int, col: int) -> int:
+        line = lines[lineno - 1]
+        return line_starts[lineno - 1] + len(line.encode("utf-8")[:col].decode("utf-8"))
+
+    bindings: list[str] = []
+    spans: list[tuple[int, int, str]] = []
+    for arg, node in default_nodes:
+        if arg.arg not in defaults:
+            continue
+        value = defaults[arg.arg]
+        try:
+            expression = renderer.render(value)
+        except _ConstexprUnrenderable as e:
+            _raise_constexpr_error(
+                kernel_name, f"parameter {arg.arg!r} default", value, e
+            )
+        _warn_enum_constexpr_renderings(
+            kernel_name, arg.arg, *renderer.take_enum_members()
+        )
+        if ast.dump(ast.parse(expression, mode="eval")) == ast.dump(
+            ast.Expression(body=node)
         ):
-            return obj
-        return repr_children.rebuild(children)
-    return obj
+            continue
+        binding = f"__inductor_constexpr_default_{len(bindings)}"
+        bindings.append(f"{binding} = {expression}")
+        start = offset(node.lineno, node.col_offset)
+        end = offset(node.end_lineno, node.end_col_offset)  # type: ignore[arg-type]
+        spans.append((start, end, binding))
+    for start, end, binding in sorted(spans, reverse=True):
+        kernel_src = kernel_src[:start] + binding + kernel_src[end:]
+    return kernel_src, bindings
 
 
 ReuseKey = tuple[torch.device, torch.dtype, str, bool, int, tuple[int, int] | None]
@@ -3711,7 +4315,11 @@ class PythonWrapperCodegen(CodeGen):
                 if arg.name in kwargs:
                     # the arg may not appear in kwargs if it is an autotuned arg.
                     # in this case, it will be added in triton_heuristics after autotuning.
-                    constants[arg.name] = kwargs[arg.name]
+                    constants.update(
+                        _normalize_constexpr_mapping(
+                            {arg.name: kwargs[arg.name]}, original_name
+                        )
+                    )
 
             else:
                 # the only case where arg name isn't in kwargs, should be
@@ -3897,7 +4505,9 @@ class PythonWrapperCodegen(CodeGen):
             ):
                 precomputed_grids.append(
                     {
-                        "config": config_to_dict(cfg),
+                        "config": _normalize_constexpr_mapping(
+                            config_to_dict(cfg), original_name
+                        ),
                         "python": [*map(pexpr, grid)],
                         "cpp": [*map(cexpr, grid)],
                         "python_slow": [*map(pexpr, grid)],
@@ -3958,33 +4568,66 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta.update(triton_info_kernel_cls.inductor_meta_common())
 
         compile_wrapper.splice(triton_info_kernel_cls.gen_common_triton_imports())
-        for type_spec in get_importable_constexpr_types(
-            triton_meta.get("constants", {}).values()
-        ):
-            compile_wrapper.writeline(
-                f"from {type_spec.module} import "
-                f"{type_spec.root_name} as {type_spec.root_name}"
+        renderer = _ConstexprRenderer()
+        config_dicts = [
+            _normalize_constexpr_mapping(config_to_dict(cfg), original_name)
+            for cfg in configs
+        ]
+        precomputed_grids = inductor_meta.get("precomputed_grids", [])
+        rendered_mappings = _render_constexpr_mappings(
+            renderer,
+            [
+                triton_meta.get("constants", {}),
+                *config_dicts,
+                *(entry["config"] for entry in precomputed_grids),
+            ],
+            original_name,
+        )
+        # The rendered mappings hold _SourceLiteral placeholders and exist only to
+        # be repr'd into the generated source below; the returned/cached metas keep
+        # real values so downstream consumers (KernelCallLine, AOTI) never compare
+        # against placeholders.
+        rendered_config_dicts = rendered_mappings[1 : 1 + len(config_dicts)]
+        rendered_grids = [
+            {**entry, "config": rendered_config}
+            for entry, rendered_config in zip(
+                precomputed_grids, rendered_mappings[1 + len(config_dicts) :]
             )
+        ]
+        source_triton_meta = {**triton_meta, "constants": rendered_mappings[0]}
+        source_inductor_meta = (
+            {**inductor_meta, "precomputed_grids": rendered_grids}
+            if precomputed_grids
+            else inductor_meta
+        )
+        kernel_src = user_defined_triton_kernel_transitive_closure_source_code(
+            kernel, epilogue_fusion
+        )
+        kernel_src, default_bindings = _rewrite_constexpr_defaults(
+            renderer, kernel, kernel_src, original_name
+        )
+        for line in [*renderer.imports, *default_bindings]:
+            compile_wrapper.writeline(line)
         if config.triton.proton_profiling:
             compile_wrapper.writeline('pl.enable_semantic("triton")')
 
-        # Sanitize triton_meta to convert Enum values for valid Python repr
-        sanitized_triton_meta = _sanitize_for_repr(triton_meta)
-        compile_wrapper.splice(
+        # Like kernel_src below, this text is spliced into the '''...''' literal
+        # passed to async_compile.triton and therefore parsed twice; escape it so
+        # rendered constants whose reprs carry backslashes or quotes (e.g. "a\nb",
+        # bytes) survive the outer parse intact.
+        decorator_src = _escape_triton_kernel_source_for_wrapper(
             f"""
             @triton_heuristics.user_autotune(
-                configs={[*map(config_to_dict, configs)]!r},
-                inductor_meta={inductor_meta!r},
-                triton_meta={sanitized_triton_meta!r},
+                configs={rendered_config_dicts!r},
+                inductor_meta={source_inductor_meta!r},
+                triton_meta={source_triton_meta!r},
                 filename=__file__,
                 custom_kernel=True,
             )
             @triton.jit
             """
         )
-        kernel_src = user_defined_triton_kernel_transitive_closure_source_code(
-            kernel, epilogue_fusion
-        )
+        compile_wrapper.splice(decorator_src)
         if config.triton.unique_user_kernel_names:
             # We replace the original_name with the unique name.
             kernel_src = kernel_src.replace(f"def {original_name}(", f"def {name}(")

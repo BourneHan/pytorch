@@ -41,6 +41,8 @@ from torch._dynamo.utils import (
     set_locals_to_steal,
 )
 from torch._functorch._aot_autograd.runtime_wrappers import (
+    _AutogradBackwardCompiler,
+    _BackwardSpecialization,
     AutogradLazyBackwardCompileInfo,
     CachedAutogradLazyBackwardCompileInfo,
 )
@@ -109,6 +111,28 @@ def maybe_clone(x: torch.Tensor | None) -> torch.Tensor | None:
     return x
 
 
+# Note [Compiled autograd and pruned backward outputs]
+# proxy_call_aot_backward reads this pruning state from an AOTAutograd
+# CompiledFunction (see Note [Grad-output prototype protocol] in
+# torch/_functorch/_aot_autograd/runtime_wrappers.py):
+#   - CompiledFunction._aot_prune_unused_outputs: class attribute baked at
+#     compile time. When False none of the state below is read and the CA graph
+#     is the plain prologue -> backward -> epilogue pipeline.
+#   - CompiledFunction._aot_backward_compiler: class attribute owning the
+#     specialization ladder (select_specialized_backward) the eager backward
+#     runs, so both paths pick the same graph for a pattern of undefined output
+#     tangents and share its memoization and retrace failure guard.
+#   - ctx._aot_grad_output_prototypes: per-forward static tangent schema,
+#     closed over as a constant.
+#   - ctx._aot_grad_output_prototype_objects: per-forward stored tensors plus,
+#     when compiled autograd was enabled at forward time, the size carriers the
+#     prologue reads dynamic tangent sizes from; read through a getattr node so
+#     the graph sees them at runtime.
+# The eager backward hands the prologue
+# ctx._aot_skip_materialize_grad_output_indices; compiled autograd instead
+# closes over the selected specialization's skip_materialize_indices, feeds the
+# specialized graph only its kept arguments and masks the pruned outputs to
+# None itself.
 class _AOTCompiledFunction(Protocol):
     """Structural type for the AOTAutograd autograd.Function subclass that
     compiled autograd retraces. The concrete class is generated locally inside
@@ -123,6 +147,9 @@ class _AOTCompiledFunction(Protocol):
     _aot_id: int
     _bw_prologue_fn: Callable[..., Any]
     _bw_epilogue_fn: Callable[..., Any]
+    # See Note [Compiled autograd and pruned backward outputs]
+    _aot_prune_unused_outputs: bool
+    _aot_backward_compiler: _AutogradBackwardCompiler
 
 
 def extract_bw_module(CompiledFunction: _AOTCompiledFunction) -> GraphModule:
@@ -495,6 +522,7 @@ class AutogradCompilerInstance:
 
     def proxy_call_aot_backward(
         self,
+        inputs: Sequence[Any],
         pinputs: Sequence[Any],
         psaved_tensors: Sequence[torch.Tensor],
         saved_tensors: Sequence[torch.Tensor],
@@ -532,7 +560,38 @@ class AutogradCompilerInstance:
         aot_id = CompiledFunction._aot_id
         bw_prologue_fn = CompiledFunction._bw_prologue_fn
         bw_epilogue_fn = CompiledFunction._bw_epilogue_fn
+        prune_unused_outputs = CompiledFunction._aot_prune_unused_outputs
+        backward_compiler = CompiledFunction._aot_backward_compiler
         del CompiledFunction
+
+        # See Note [Compiled autograd and pruned backward outputs]
+        specialization: _BackwardSpecialization | None = None
+        pruned_output_indices: tuple[int, ...] = ()
+        skip_materialize_grad_output_indices: tuple[int, ...] = ()
+        grad_output_prototypes: Sequence[Any] = ()
+        if prune_unused_outputs:
+            grad_output_prototypes = ctx._aot_grad_output_prototypes  # type: ignore[attr-defined]
+            undefined_grad_out_indices = tuple(
+                i for i, grad in enumerate(inputs) if grad is None
+            )
+            if undefined_grad_out_indices:
+                # The retrace runs autograd under fake tensors; keep it out of
+                # this capture.
+                with _disable():
+                    specialization = backward_compiler.select_specialized_backward(
+                        undefined_grad_out_indices
+                    )
+                if specialization is None:
+                    pruned_output_indices = (
+                        backward_compiler.get_pruned_backward_output_indices(
+                            undefined_grad_out_indices
+                        )
+                    )
+                else:
+                    pruned_output_indices = specialization.pruned_output_indices
+                    skip_materialize_grad_output_indices = (
+                        specialization.skip_materialize_indices
+                    )
 
         if torch.is_grad_enabled():
             for output_alias_info in metadata.output_info:
@@ -547,24 +606,38 @@ class AutogradCompilerInstance:
             ctx_symints: Sequence[IntLikeType],
             ctx_opaque_objs: Sequence[Any],
             flat_args: Sequence[Any],
+            grad_output_prototype_objects: Sequence[Any] = (),
         ) -> Any:
             return bw_prologue_fn(
                 ctx_saved_tensors,
                 ctx_symints,
                 ctx_opaque_objs,
-                flat_args,
+                list(flat_args),
+                grad_output_prototypes,
+                grad_output_prototype_objects,
+                skip_materialize_grad_output_indices,
             )
 
+        pprologue_args: list[Any] = [psaved_tensors, psymints, popaque_objects, pinputs]
+        if prune_unused_outputs:
+            # The tensors and size carriers the prologue materializes zero
+            # tangents from live on ctx; read them through a getattr node so the
+            # graph sees them at runtime (passing ctx itself to an
+            # allow_in_graph target would require Dynamo to proxy
+            # AutogradFunctionContextVariable).
+            pprologue_args.append(
+                self.fx_tracer.create_proxy(
+                    kind="call_function",
+                    target=getattr,
+                    args=(pctx, "_aot_grad_output_prototype_objects"),
+                    kwargs={},
+                )
+            )
         pgrads = self.fx_tracer.create_proxy(
             kind="call_function",
             # pyrefly: ignore [bad-argument-type]
             target=call_aot_bwd_prologue,
-            args=(
-                psaved_tensors,
-                psymints,
-                popaque_objects,
-                pinputs,
-            ),
+            args=tuple(pprologue_args),
             kwargs={},
         )
 
@@ -573,7 +646,7 @@ class AutogradCompilerInstance:
             pbackward_state = self.hooks_proxy[maybe_backward_state_idx]  # type: ignore[index]
 
         # Copy-paste the AOT backward graph into the compiled autograd graph
-        def copy_paste_aot_backward_graph() -> list[torch.Tensor]:
+        def copy_paste_aot_backward_graph() -> list[torch.Tensor | None]:
             def num_inputs(graph: torch.fx.Graph) -> int:
                 num_args = 0
                 for node in graph.nodes:
@@ -601,13 +674,19 @@ class AutogradCompilerInstance:
             # Add backward_state
             if pbackward_state is not None:
                 pall_args.append(pbackward_state)
+            # A specialized backward consumes a subset of the base backward's
+            # arguments (the undefined tangents are gone).
+            bw_module_to_copy = bw_module
+            if specialization is not None:
+                bw_module_to_copy = specialization.bw_module
+                pall_args = [pall_args[i] for i in specialization.kept_arg_indices]
 
             # run over all nodes of the aot_backward graph.
             # copy and paste them all into the compiled autograd graph.
             args_idx = 0
             # pyrefly: ignore [implicit-any]
             value_remap = {}
-            poutputs: list[torch.fx.Proxy] | None = None
+            poutputs: list[torch.fx.Proxy | None] | None = None
 
             # names of nodes must appear only once in the fx.Graph
             # dedup AOT backwards that appear multiple times
@@ -620,7 +699,7 @@ class AutogradCompilerInstance:
                 # make it both informative and unique
                 return f"aot{deduped_aot_id}_{node_name}"
 
-            for node in bw_module.graph.nodes:
+            for node in bw_module_to_copy.graph.nodes:
                 if node.op == "placeholder":
                     ph = pall_args[args_idx].node
                     ph.name = make_unique(node.name)
@@ -640,7 +719,9 @@ class AutogradCompilerInstance:
                 elif node.op == "get_attr":
                     name = node.target
                     qualname = self.fx_tracer.get_fresh_qualname(name)
-                    setattr(self.fx_tracer.root, qualname, getattr(bw_module, name))
+                    setattr(
+                        self.fx_tracer.root, qualname, getattr(bw_module_to_copy, name)
+                    )
                     result = self.fx_tracer.create_node("get_attr", qualname, (), {})
                     result.name = make_unique(node.name)
                     value_remap[node] = result
@@ -658,7 +739,9 @@ class AutogradCompilerInstance:
                 elif node.op == "call_module":
                     name = node.target
                     qualname = self.fx_tracer.get_fresh_qualname(name)
-                    setattr(self.fx_tracer.root, qualname, getattr(bw_module, name))
+                    setattr(
+                        self.fx_tracer.root, qualname, getattr(bw_module_to_copy, name)
+                    )
                     result = self.fx_tracer.graph.node_copy(
                         node, lambda n: value_remap[n]
                     )
@@ -669,6 +752,14 @@ class AutogradCompilerInstance:
 
             if poutputs is None:
                 raise AssertionError("No output node found in backward graph")
+
+            for idx in pruned_output_indices:
+                if idx >= len(poutputs):
+                    raise AssertionError(
+                        f"pruned backward output index {idx} out of range for "
+                        f"{len(poutputs)} outputs"
+                    )
+                poutputs[idx] = None
 
             # In general we don't know what the shapes of the outputs are, so allocate
             # some dummy sizes for them.
@@ -738,6 +829,7 @@ class AutogradCompilerInstance:
         if hasattr(ctx._forward_cls, "_aot_id"):  # type: ignore[attr-defined]
             # AOT backward
             proxies = self.proxy_call_aot_backward(
+                inputs,
                 pinputs,
                 psaved_tensors,
                 saved_tensors,

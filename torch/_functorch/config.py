@@ -41,6 +41,31 @@ fake_tensor_allow_meta = os.environ.get("FAKE_ALLOW_META", "1") != "0"
 # but it is on by default for aot_eager.
 debug_assert = False
 
+# Preserve undefined user grad outputs and specialize AOTAutograd backward graphs
+# around them (retracing or structurally pruning the backward per observed
+# undefined-tangent pattern). Default OFF: the machinery trades per-call
+# overhead and backward-time compiles for specialized backwards, and is
+# consumed by torch.compiler.precompile (which enables it during capture);
+# ordinary torch.compile keeps the zero-materialization behavior. The value is
+# read once when a graph is compiled and baked into its autograd.Function
+# (CompiledFunction._aot_prune_unused_outputs); flipping it afterwards does
+# not change already-compiled functions.
+#
+# When ON:
+# - The backward retrace re-executes the traced callable at backward time
+#   (from eager autograd and from compiled autograd), so it is only attempted
+#   for fx.GraphModule callables (torch.compile and aot_module_simplified
+#   graphs), never for arbitrary Python passed to aot_function or
+#   allow_in_graph; those graphs use structural specialization or zero
+#   materialization instead.
+# - Every training graph retains its traced callable, fake example inputs,
+#   forward module and metadata for the life of the compiled function.
+# - AOTAutograd cache hits carry no retrace state and lose exact
+#   specialization (structural specialization / zero materialization only).
+# - A pruned backward output's grad is None rather than zeros -- see Note
+#   [Pruned-tangent grads: None vs zeros] in _aot_autograd/runtime_wrappers.py.
+aot_autograd_prune_unused_outputs = False
+
 debug_partitioner = os.environ.get("AOT_PARTITIONER_DEBUG", "0") != "0"
 
 # See # NOTE [Export custom triton op]

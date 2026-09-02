@@ -430,6 +430,13 @@ class SubclassCreationMeta:
                 creation_meta.make_runtime_safe()
 
     def __post_init__(self) -> None:
+        # Serialized runtime metadata has already discarded the fake tensor.
+        if self.original_subclass is None:
+            if self.original_subclass_type is None:
+                raise AssertionError(
+                    "runtime-safe subclass metadata must retain its subclass type"
+                )
+            return
         # sanity assert to make sure we don't leak memory
         if not is_fake(self.original_subclass):
             raise AssertionError(
@@ -504,6 +511,10 @@ class ViewAndMutationMeta:
     # Instead, we keep any necessary subclass metadata necessary about each traced_tangent.
     # This list is generated after calling make_runtime_safe().
     traced_tangent_metas: list[Any] | None = None
+
+    # Same length and order as traced_tangents. Retained for runtime diagnostics
+    # after the fake traced tangents themselves are discarded.
+    traced_tangent_dtypes: list[torch.dtype | None] | None = None
 
     num_symints_saved_for_bw: int | None = None
 
@@ -734,7 +745,8 @@ class ViewAndMutationMeta:
         There are various fields in ViewAndMutationMeta that aren't serializable. This function is called after all tracing
         is completed to simplify certain fields in the metadata so that they can be safely cached.
 
-        Doing so may lose information (in the case of traced_tangents), but none of the information is needed at runtime.
+        Doing so may lose information from traced_tangents while retaining the
+        runtime-safe summaries needed by the wrappers.
         """
         # TODO: This function is only a best effort: there are other fields that may not be cache safe
         # (i.e., there's no guarantee that tensor_flatten() returns a serializable result), or that
@@ -742,6 +754,10 @@ class ViewAndMutationMeta:
         if self.traced_tangent_metas is not None:
             raise AssertionError(
                 "traced_tangent_metas should be None before calling make_runtime_safe"
+            )
+        if self.traced_tangent_dtypes is not None:
+            raise AssertionError(
+                "traced_tangent_dtypes should be None before calling make_runtime_safe"
             )
 
         def extract_metadata(t: object) -> tuple[Sequence[str], object] | None:
@@ -757,6 +773,10 @@ class ViewAndMutationMeta:
                 return None
 
         self.traced_tangent_metas = [extract_metadata(t) for t in self.traced_tangents]
+        self.traced_tangent_dtypes = [
+            t.dtype if isinstance(t, torch.Tensor) else None
+            for t in self.traced_tangents
+        ]
         # Clear traced tangents at runtime
         self.traced_tangents = []
         for inp_meta in self.subclass_inp_meta:
@@ -1457,6 +1477,56 @@ class AOTGraphCapture:  # Produced by aot_stage1_graph_capture
 
     # Metadata about subclass inputs/outputs in the graph trace.
     maybe_subclass_meta: Any
+
+    # Snapshot of the joint trace's inputs, taken only when
+    # aot_autograd_prune_unused_outputs is on and the backward may be retraced
+    # at runtime (see can_retrace_backward in aot_stage1_graph_capture).
+    autograd_joint_trace_inputs: AOTAutogradJointTraceInputs | None = None
+
+
+@dataclass
+class AOTAutogradJointTraceInputs:
+    """What aot_stage1_graph_capture traced the joint from, snapshotted before
+    the trace (tracing mutates fw_metadata and re-detaches the example inputs).
+
+    flat_fn is the wrapped callable AOTAutograd traced; the retrace gate only
+    admits callables whose unwrapped form is an fx.GraphModule, so re-running
+    it at backward time replays captured ops rather than user Python.
+    flat_args are detached copies of the fake example inputs with requires_grad
+    preserved. fw_metadata is a shallow copy with copied containers, so the
+    retrace can null traced_tangents without touching the live metadata.
+    autocast_state is _autocast_fingerprint() at trace time; the retrace
+    declines when the backward-time state differs.
+    """
+
+    flat_fn: TraceFn
+    flat_args: list[FxValue]
+    flat_args_descs: list[AOTInput]
+    fw_metadata: ViewAndMutationMeta
+    autocast_state: tuple[Any, ...]
+
+
+@dataclass
+class AOTAutogradTraceInfo:
+    """Everything _retrace_backward_for_undefined_grad_outputs needs to
+    re-derive a backward for a runtime pattern of undefined output tangents.
+
+    Built by aot_stage2_autograd once the joint has been partitioned, so every
+    field is populated at construction. It hangs off
+    AutogradLazyBackwardCompileInfo for the lifetime of the compiled autograd
+    function and retains the traced callable, fake inputs, forward module and
+    metadata. It is compile-time-only state that never enters AOTAutograd cache
+    entries: a cache hit has no trace info and falls back to structural
+    specialization or zero materialization.
+    """
+
+    joint_trace: AOTAutogradJointTraceInputs
+    partition_fn: Callable[..., Any]
+    original_fw_module: torch.fx.GraphModule
+    # One key per backward placeholder (see _backward_placeholder_key),
+    # snapshotted here because the AOT cache strips node.meta from the live
+    # backward module when it serializes it.
+    bw_placeholder_keys: tuple[tuple[str, str], ...]
 
 
 FakifiedFlatArgs = NewType("FakifiedFlatArgs", list[Any])
