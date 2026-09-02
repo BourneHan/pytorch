@@ -26,6 +26,8 @@ __all__ = [
 ]
 
 
+# 已看完
+# 生成用于屏蔽后续位置的方阵掩码
 def _generate_square_subsequent_mask(
     sz: int,
     device: torch.device | None = None,
@@ -35,12 +37,17 @@ def _generate_square_subsequent_mask(
 
     The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
     """
+    #https://docs.pytorch.org/docs/2.13/generated/torch.triu.html中有:
+    #   the other elements of the result tensor out are set to 0.
+    #   If diagonal = 0, all elements on and above the main diagonal are retained.
+    #   A positive value excludes just as many diagonals above the main diagonal
     return torch.triu(
         torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
         diagonal=1,
     )
 
 
+# 已看完
 def _get_seq_len(src: Tensor, batch_first: bool) -> int | None:
     if src.is_nested:
         return None
@@ -1206,9 +1213,12 @@ def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
     raise RuntimeError(f"activation should be relu/gelu, not {activation}")
 
 
+# 已看完
+# 检测是否为标准因果掩码
+# Causal（因果）有着极其严格的定义：它特指标准的、下三角全为1(或上三角全为-infty)的方阵掩码
 def _detect_is_causal_mask(
     mask: Tensor | None,
-    is_causal: bool | None = None,
+    is_causal: bool | None = None, # 因为需要区分三种状态：用户明确知道是因果掩码（True）; 用户明确知道不是因果掩码（False）; 用户不确定/让系统自动检测（None）
     size: int | None = None,
 ) -> bool:
     """Return whether the given attention mask is causal.
@@ -1231,19 +1241,33 @@ def _detect_is_causal_mask(
        Otherwise, checks for any causal mask.
     """
     # Prevent type refinement
+    # # 假设我们没有引入新变量 `make_causal`
+    # if is_causal is None and mask is not None:
+    #     # 在这个分支里，类型检查器 100% 知道 is_causal 是 None
+    #     ...
+    #     if mask.size() == causal_comparison.size():
+    #         is_causal = bool((mask == causal_comparison).all())
+    #     else:
+    #         is_causal = False
+	# return is_causal  # 类型检查器推导的返回类型可能变得极度复杂
     make_causal = is_causal is True
 
     if is_causal is None and mask is not None:
+        # 在矩阵乘法:Q X K^T中，结果矩阵的形状是 (..., L, S)；行数（-2 维）决定了有多少个 Query 需要进行掩码计算。
+        # 在 90% 的传统任务中，Cross-Attention 不需要 Causal Mask。但 PyTorch 作为一个支持全世界开发者各种“魔改”的底层框架，必须假设有人会在 L != S 的 Cross-Attention 里玩出新花样（如流式多模态、Prefix 掩码）。
+        # 使用 mask.size(-2)（Query 长度）是唯一能在数学逻辑和框架健壮性上同时闭环的选择。
         sz = size if size is not None else mask.size(-2)
         causal_comparison = _generate_square_subsequent_mask(
             sz, device=mask.device, dtype=mask.dtype
         )
 
-        # Do not use `torch.equal` so we handle batched masks by
-        # broadcasting the comparison.
+        # Do not use `torch.equal` so we handle batched masks by   #历史注释问题
+        # broadcasting the comparison.   
+        # 如果 Cross-Attention 的 L != S，那么 mask.size() == causal_comparison.size() 确实必然返回 False，因为causal_comparison为方阵而mask不是。
+        # mask在 PyTorch 底层加速算子的眼里，它不属于标准因果方阵，不能偷懒用硬件一键加速了，老老实实把这个非方阵的 mask 传入 CUDA 核心，做矩阵减法/加法吧。
         if mask.size() == causal_comparison.size():
-            make_causal = bool((mask == causal_comparison).all())
-        else:
-            make_causal = False
+            make_causal = bool((mask == causal_comparison).all())   # mask == causal_comparison	逐元素比较，生成布尔张量(tensor)
+        else:                                                       # tensor.all() 返回一个 0 维布尔张量（torch.bool 标量），表示张量中所有元素是否都为 True
+            make_causal = False                                     # .all() 返回的是 torch.Tensor，不是 Python bool; bool() 显式转换为 Python 原生 bool 类型
 
     return make_causal

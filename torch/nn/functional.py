@@ -6582,6 +6582,7 @@ def _mha_shape_check(
     return is_batched
 
 
+# 已看完
 def _canonical_mask(
     mask: Tensor | None,
     mask_name: str,
