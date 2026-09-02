@@ -70,25 +70,27 @@ typedef struct VISIBILITY_HIDDEN CacheEntry {
   CacheEntry& operator=(CacheEntry&&) = default;
   ~CacheEntry();
 
-  void invalidate(py::object deleted_guard_manager);
+  // The Python objects an invalidated entry gives up. Released by the caller
+  // once cache_mutex is dropped: the decrefs and the attribute clears on
+  // guard_manager run Python.
+  struct Detached {
+    py::object guard_manager;
+    py::object code;
+    py::object backend;
+  };
+  // Runs no Python. Points this entry at deleted_guard_manager and hands back
+  // what it held; the caller clears the old guard_manager's cache_entry and
+  // extra_state attributes after unlocking.
+  Detached invalidate(py::object deleted_guard_manager);
   // Called from the python side to update the diff guard root manager
   void update_diff_guard_root_manager();
 } CacheEntry;
 C10_DIAGNOSTIC_POP()
 C10_DIAGNOSTIC_POP()
 
-#endif
-
-// Returns borrowed reference
-PyCodeObject* CacheEntry_get_code(CacheEntry* e);
-
-// Returns borrowed string representation of CompileContext
-const char* CacheEntry_get_trace_annotation(CacheEntry* e);
-
-// Returns a borrowed reference to CacheEntry as a PyObject
-// Warning: lifetime is controlled by C++
-PyObject* CacheEntry_to_obj(CacheEntry* e);
-
-#ifdef __cplusplus
 } // extern "C"
+
+// Borrowed on success, nullptr when absent, without raising. `name` must be an
+// interned (or otherwise immortal) str.
+PyObject* lookup_optional_attr(py::handle obj, PyObject* name);
 #endif
