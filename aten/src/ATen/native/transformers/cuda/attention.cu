@@ -710,6 +710,7 @@ __host__ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cuda(
   return std::make_tuple(std::move(q_k_v_s[0]), std::move(q_k_v_s[1]), std::move(q_k_v_s[2]));
 }
 
+// transformers/attention.cpp中对应有:native_multi_head_attention_cpu
 std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     const Tensor& query,
     const Tensor& key,
@@ -724,7 +725,7 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     bool need_weights,
     bool average_attn_weights,
     const std::optional<int64_t> mask_type) {
-  // query shape: [B, T, D]
+  // query shape: [B, T, D]           // key和value的shape也是和query一样
   // qkv_weight shape: [3 * D, D]
 
   TORCH_CHECK(
@@ -754,9 +755,9 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
       "-D tensor");
   TORCH_CHECK(
       query.is_nested() || key.is_nested() || value.is_nested() ||
-          (query.sizes() == key.sizes() && key.sizes() == value.sizes()),
-      "expected `query`/`key`/`value` shapes to match");
-  TORCH_CHECK(
+          (query.sizes() == key.sizes() && key.sizes() == value.sizes()), // 这个检查只在非 nested 情况下要求 query/key/value 形状完全相同
+      "expected `query`/`key`/`value` shapes to match");                  // 这个fast path只支持self-attention(T_q == T_kv); 
+  TORCH_CHECK(                                                            // Cross-attention 会走慢速路径（Python 层的 MultiheadAttention.forward）???
       qkv_weight.dim() == 2,
       "expected 2-D `qkv_weight`, got ",
       qkv_weight.dim(),
@@ -825,8 +826,13 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     }
     // Returned math or error lets not use it
   }
-
-  // shape: [B, T, 3 x D]
+                          // 上有:
+                          //  query shape: [B, T, D]
+                          //  key和value的shape也是和query一样
+                          //  qkv_weight shape: [3 * D, D]        // qkv_projection中有:会对qkv_weight做转置
+                          //  这个fast path只支持self-attention(T_q == T_kv)
+  // shape: [B, T, 3 x D] // 多头注意力的QKV投影(projection),即用融合的权重矩阵将输入映射为Q、K、V 三部分。
+  // 论文概念:每个head独立投影; 代码实现:融合投影qkv_weight的shape:[3 * D, D],1次大矩阵乘法,减少kernel launch,计算效率提升了数倍.
   auto qkv = qkv_projection(query, key, value, embed_dim, qkv_weight);
 
   if (!qkv.is_nested() && qkv.numel() == 0) {
@@ -849,9 +855,9 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   if (!qkv.is_nested()) {
     std::cerr << "qkv: " << qkv << std::endl;
   }
-#endif
-  // shape: 3 x [B, num_head, T, dim_per_head]
-  auto [q, k, v] = _transform_bias_rescale_qkv(qkv, qkv_bias, num_head);
+#endif                                            // 拆头:将shape为[B, T, D]的q,k,v按照head拆开:[B, T, D]--->[B, T, H, D/H]--->[B, H, T, D/H]
+  // shape: 3 x [B, num_head, T, dim_per_head]    // 转换后的这个shape方便下面的auto qkt = bmm_nt(q, k);得到正确结果
+  auto [q, k, v] = _transform_bias_rescale_qkv(qkv, qkv_bias, num_head); // 里面涉及:compute q = (q + q_bias) / sqrt(dim_per_head), k = k + k_bias, v = v + v_bias
   qkv = Tensor(); // Not used any more, allow free
 #ifndef NDEBUG
   debug_assert_shape(__LINE__, q, {B, num_head, T, dim_per_head});
@@ -864,7 +870,9 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   std::cerr << "v: " << v << std::endl;
 #endif
 
-  // shape: [B, num_head, T, T]
+  // shape: [B, num_head, T, T] // 上有:这个fast path只支持self-attention(T_q == T_kv)
+  // 计算注意力分数 
+  // "Attention Is All You Need"中有:矩阵相乘的结果矩阵的一行表示:一个q分别与L个k的dot product;
   auto qkt = bmm_nt(q, k);
   // q & k are dead but cannot be freed because they were packed with v
 #ifndef NDEBUG
@@ -877,14 +885,36 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   // shape: [B, num_head, T, T]
   // TODO: long-term, have a kernel that works with
   // NestedTensor directly if there is no mask passed
+  //mask的三种形态
+	//   mask_type											 形状	
+	//	0 (src_mask)								    [T, T]
+	//	1 (src_key_padding_mask)		    [B, T]
+	//	2 (default_mask)						 [B, H, T, T]
+	//src_mask因果掩码(causal mask),是上三角,Decoder自注意力中防止"偷看未来"的掩码：
+	//上三角为 -inf（bool 版本则上三角为 True 表示屏蔽）
+	//mask = torch.triu(torch.full((T, T), float('-inf')), diagonal=1) 
+	//	_generate_square_subsequent_mask中有:torch.triu(torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),diagonal=1,)
+	// tensor([[0.,   -inf, -inf, -inf, -inf],
+	//         [0.,   0.,   -inf, -inf, -inf],
+	//         [0.,   0.,   0.,   -inf, -inf],
+	//         [0.,   0.,   0.,   0.,   -inf],
+	//         [0.,   0.,   0.,   0.,   0.  ]])
+  //  qkt的行为query,列为key,使用mask以实现:位置i的query仅能attend到j<=i的key
   qkt = masked_softmax(qkt, mask, query, mask_type);
+    //此函数的核心操作:
+    //  如果有 mask，先应用 mask（将 masked 位置设为 -inf）
+    //  qkt = qkt.masked_fill(mask, -std::numeric_limits<float>::infinity());
+    //  沿最后一维（T 维）做 softmax
+    //qkt的shape未改变,"Attention Is All You Need"中有:结果矩阵的一行表示:一个q分别与L个k间的Attention weights;
 #ifdef DEBUG_PRINT_EACH_STEP
   std::cerr << "qkt after softmax: " << qkt << std::endl;
 #endif
 
   // shape: [B, num_head, T, dim_per_head]
-  // reuse storage for q; we're done with it
-  auto attn_ctx = bmm_nn(q, qkt, v);
+  // reuse storage for q; we're done with it   //q在bmm_nt(q, k)算完注意力分数后已经不再需要, q的形状[B, H, T, DH]恰好与输出attn_ctx相同
+  // qkt的shape是[B, num_head, T, T]; v的shape是[B, num_head, T, dim_per_head]
+  //  关于qkt,"Attention Is All You Need"中有:结果矩阵的一行表示:一个q分别与L个k间的Attention weights;
+  auto attn_ctx = bmm_nn(q, qkt, v);  // 关于attn_ctx,"Attention Is All You Need"中有:矩阵相乘的结果矩阵的一行表示:一个q用L个v表示出来的维度为dv的vector
   // qkv is not dead; we just reused storage for q!
   if (!need_weights) {
     qkt = Tensor();
@@ -898,7 +928,14 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
 
   // shape: [B, T, D]
   // Fuse transform_0213 inside
-  auto proj = transform0213_gemm_nt_bias(
+  // attn_ctx的shape为:[B, num_head, T, dim_per_head]
+  // proj_weight的shape为:[D, D]
+  //  "Attention Is All You Need"中有:
+  //    These are concatenated and once again projected, resulting in the final values
+  //    The linear transformation allows the model to learn how to mix or reweight the contributions from different heads in a data-driven way
+  //      transform_0213中有:对attn_ctx,交换维度1和2(H和T):[B, H, T, DH] → [B, T, H, DH],然后合并最后两维:[B, T, H, DH] → [B, T, D], 相当于将所有head的输出concatenated了(合并头)
+  //      transform0213_gemm_nt_bias会将transform_0213的结果及proj_weight, proj_bias传给at::native::linear(),即做线性变换,得到最终的输出
+  auto proj = transform0213_gemm_nt_bias(  
       attn_ctx, proj_weight, proj_bias, query);
 #ifndef NDEBUG
   debug_assert_shape(__LINE__, proj, {B, T, D});

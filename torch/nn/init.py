@@ -62,6 +62,7 @@ _NonlinearityType = Literal[
 _FanMode = Literal["fan_in", "fan_out"]
 
 
+# 已看完
 # These no_grad_* functions are necessary as wrappers around the parts of these
 # functions that use `with torch.no_grad()`. The JIT doesn't support context
 # managers, so these need to be implemented as builtins. Using these wrappers
@@ -69,7 +70,7 @@ _FanMode = Literal["fan_in", "fan_out"]
 def _no_grad_uniform_(
     tensor: Tensor, a: float, b: float, generator: torch.Generator | None = None
 ) -> Tensor:
-    with torch.no_grad():
+    with torch.no_grad():   # 临时禁用梯度追踪
         return tensor.uniform_(a, b, generator=generator)
 
 

@@ -95,23 +95,38 @@ Tensor gemm_nt(const Tensor& self, const Tensor& other) {
   }
 }
 
-Tensor transform_0213(const Tensor& a) {
+Tensor transform_0213(const Tensor& a) {    // 为什么叫 0213？ 维度索引重排：[0, 1, 2, 3] → [0, 2, 1, 3]
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(a.size(1));
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(a.size(3));
-  return a.permute({0, 2, 1, 3})
+  return a.permute({0, 2, 1, 3})  // 交换维度1和2(H和T):[B, H, T, DH] → [B, T, H, DH]; 返回新张量,a本身不变
       .contiguous()
-      .view({a.size(0), a.size(2), a.size(1) * a.size(3)});
+      .view({a.size(0), a.size(2), a.size(1) * a.size(3)}); // 合并最后两维:[B, T, H, DH] → [B, T, D]
 }
 
 } // namespace
 
 
+// 批量矩阵乘法(batched matrix multiply)的封装函数,专门用于计算注意力分数Q@K.T
+// "关于dot product"中有:Dot product in matrix form
 Tensor bmm_nt(const Tensor& a, const Tensor& b) {
+  // 1. 展平 batch 和 head 维度
   auto a_ = a.view({a.size(0) * a.size(1), a.size(2), a.size(3)});
+  // [B, H, T, DH] → [B*H, T, DH]
+  
   auto b_ = b.view({b.size(0) * b.size(1), b.size(2), b.size(3)});
+  // [B, H, T, DH] → [B*H, T, DH]
+  
+  // 2. 转置 b 的最后两个维度. 有:Tensor transpose(const Tensor& self, int64_t index0, int64_t index1)
   auto bt_ = b_.transpose(2, 1);
+  // [B*H, T, DH] → [B*H, DH, T]
+  
+  // 3. 批量矩阵乘法
   auto c_ = at::bmm(a_, bt_);
-  return c_.view({a.size(0), a.size(1), a.size(2), b.size(2)});
+  // [B*H, T, DH] @ [B*H, DH, T] → [B*H, T, T]
+  
+  // 4. 恢复原始 batch 和 head 维度
+  return c_.view({a.size(0), a.size(1), a.size(2), b.size(2)}); // 当前代码用b.size(2)是为了语义清晰和未来支持cross-attention，虽然当前用a.size(2)也行。
+  // [B*H, T, T] → [B, H, T, T]
 }
 
 Tensor masked_softmax(
@@ -203,7 +218,7 @@ Tensor qkv_projection(
   if (key.is_same(value)) {
     if (query.is_same(key)) {
       // self-attention
-      qkv = gemm_nt(query, qkv_weight);
+      qkv = gemm_nt(query, qkv_weight); // gemm_nt中有:other.t(),即:会对qkv_weight做转置,然后其就能与query做矩阵乘法
     } else {
       // encoder-decoder attention
       // TODO: is there a more efficient way to set this up?
