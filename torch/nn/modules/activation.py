@@ -1221,6 +1221,7 @@ class MultiheadAttention(Module):
             #   self.weight = Parameter(
             #       torch.empty((out_features, in_features), **factory_kwargs)
             #   )
+            #   self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
             #   Applies an affine linear transformation to the incoming data: :math:`y = xA^T + b`.
 
         
@@ -1315,7 +1316,7 @@ class MultiheadAttention(Module):
                 compatibility.
 
         Outputs:
-            - **attn_output** - Attention outputs of shape :math:`(L, E)` when input is unbatched,
+            - **attn_output** - Attention outputs of shape :math:`(L, E)` when input is unbatched,          # E = E_q = embed_dim; E_k/E_v仅在指定了不同的kdim/vdim时才与它们不同,而投影层都会先把key/value映射到embed_dim;
               :math:`(L, N, E)` when ``batch_first=False`` or :math:`(N, L, E)` when ``batch_first=True``,
               where :math:`L` is the target sequence length, :math:`N` is the batch size, and :math:`E` is the
               embedding dimension ``embed_dim``.

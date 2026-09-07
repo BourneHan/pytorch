@@ -710,7 +710,9 @@ __host__ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cuda(
   return std::make_tuple(std::move(q_k_v_s[0]), std::move(q_k_v_s[1]), std::move(q_k_v_s[2]));
 }
 
+// 已看完
 // transformers/attention.cpp中对应有:native_multi_head_attention_cpu
+// 输出是:最终注意力输出(proj_weight投影后的最终结果) + qkt注意力权重
 std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     const Tensor& query,
     const Tensor& key,
@@ -725,7 +727,7 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     bool need_weights,
     bool average_attn_weights,
     const std::optional<int64_t> mask_type) {
-  // query shape: [B, T, D]           // key和value的shape也是和query一样
+  // query shape: [B, T, D]           // key和value的shape也是和query一样,因MultiheadAttention.forward中在调用_native_multi_head_attention之前有:query与key/value不相同, 则不能使用fast path
   // qkv_weight shape: [3 * D, D]
 
   TORCH_CHECK(
@@ -755,9 +757,9 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
       "-D tensor");
   TORCH_CHECK(
       query.is_nested() || key.is_nested() || value.is_nested() ||
-          (query.sizes() == key.sizes() && key.sizes() == value.sizes()), // 这个检查只在非 nested 情况下要求 query/key/value 形状完全相同
-      "expected `query`/`key`/`value` shapes to match");                  // 这个fast path只支持self-attention(T_q == T_kv); 
-  TORCH_CHECK(                                                            // Cross-attention 会走慢速路径（Python 层的 MultiheadAttention.forward）???
+          (query.sizes() == key.sizes() && key.sizes() == value.sizes()), // 这个检查只在非nested情况下要求query/key/value形状完全相同
+      "expected `query`/`key`/`value` shapes to match");                  // 这个fast path只支持self-attention(T_q == T_kv);
+  TORCH_CHECK(                                                            // Cross-attention会走慢速路径(Python层的MultiheadAttention.forward)???
       qkv_weight.dim() == 2,
       "expected 2-D `qkv_weight`, got ",
       qkv_weight.dim(),
@@ -786,15 +788,17 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
 
 #endif
   const auto dim_per_head = D / num_head;
-  if ((query.is_same(key) && key.is_same(value)) && !need_weights) {
+  if ((query.is_same(key) && key.is_same(value)) && !need_weights) {  // 纯self-attention(q/k/v是同一个tensor) & 不需要返回注意力权重
 
     // We have not done linear projection yet but the input for SDP
     // Is expected to be 4 dimensional. We "cheaply" create view tensors
-    // That will then be used for checking hot path conditions with select_sd_backend
-    auto q = query.view({query.size(0), -1, num_head, dim_per_head}).transpose(1, 2);
-    auto k = key.view({key.size(0), -1, num_head, dim_per_head}).transpose(1, 2);
-    auto v = value.view({value.size(0), -1, num_head, dim_per_head}).transpose(1, 2);
+    // That will then be used for checking hot path conditions with select_sd_backend // 上有:query shape: [B, T, D]
+    auto q = query.view({query.size(0), -1, num_head, dim_per_head}).transpose(1, 2); // [B, T, D] → [B, T, H, DH] → [B, H, T, DH]
+    auto k = key.view({key.size(0), -1, num_head, dim_per_head}).transpose(1, 2); // [B, T, D] → [B, T, H, DH] → [B, H, T, DH]
+    auto v = value.view({value.size(0), -1, num_head, dim_per_head}).transpose(1, 2); // [B, T, D] → [B, T, H, DH] → [B, H, T, DH]
+      //select_sdp_backend只看tensor的元信息(metadata),不做任何计算,而qkv_weight投影恰好不改变这些元信息,所以用未投影的query构造的"廉价view"就足够用于探路???
 
+    // 第1步:探路——先问"如果调 SDPA，会用哪个backend?"
     sdp::sdp_params kernel_params{q, k, v, mask, 0.0, false, false};
     auto backend = select_sdp_backend(kernel_params);
     // strides from packed projection for nested tensors when seq_len is 1 will be
@@ -804,25 +808,28 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     // For mem-eff attention this will cause the expand call to error
     // For now I am going to turn of that path not have to deal with all the annoying
     // Mask type shape grossness
-    if (!mask.has_value() && no_seq_len_1_nested &&
+    if (!mask.has_value() && no_seq_len_1_nested &&   // 没有mask
         (backend == sdp::SDPBackend::flash_attention || backend == sdp::SDPBackend::efficient_attention ||
          backend == sdp::SDPBackend::cudnn_attention)) {
-      auto x = at::linear(query, qkv_weight, qkv_bias);
-      auto chunks = x.chunk(3, -1);
+      auto x = at::linear(query, qkv_weight, qkv_bias);  // [B, T, 3D]
+      auto chunks = x.chunk(3, -1);   // -1:沿最后一维切分,切成3等份,拆成 q, k, v
       auto x_size_0 = x.size(0);
 
+      // 拆头: [B, T, D] → [B, H, T, DH]
       chunks[0] = (chunks[0].view({x_size_0, -1, num_head, dim_per_head}))
                       .transpose(1, 2);
       chunks[1] = (chunks[1].view({x_size_0, -1, num_head, dim_per_head}))
                       .transpose(1, 2);
       chunks[2] = (chunks[2].view({x_size_0, -1, num_head, dim_per_head}))
                       .transpose(1, 2);
+      // 调用SDPA(Scaled Dot-Product Attention)(FlashAttention等融合kernel)
       auto y = at::scaled_dot_product_attention(
           chunks[0], chunks[1], chunks[2], mask, 0.0, false, std::nullopt);
 
+      // 合并头:[B, H, T, DH](y的shape) → [B, T, D]
       auto past_sdp = y.transpose(1, 2).reshape({x_size_0, -1, embed_dim});
       return std::make_tuple(
-          at::linear(past_sdp, proj_weight, proj_bias), Tensor());
+          at::linear(past_sdp, proj_weight, proj_bias), Tensor());  // 输出投影
     }
     // Returned math or error lets not use it
   }
@@ -904,9 +911,8 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   //    merge_masks部分有:expanded to shape (batch_size, num_heads, seq_len, seq_len)
   qkt = masked_softmax(qkt, mask, query, mask_type);
     //此函数的核心操作:
-    //  如果有 mask，先应用 mask（将 masked 位置设为 -inf）
-    //  qkt = qkt.masked_fill(mask, -std::numeric_limits<float>::infinity());
-    //  沿最后一维（T 维）做 softmax
+    //  如果有mask，先应用mask(将masked位置设为-inf): qkt = qkt.masked_fill(mask, -std::numeric_limits<float>::infinity());
+    //  沿最后一维（T维）做 softmax
     //qkt的shape未改变,"Attention Is All You Need"中有:结果矩阵的一行表示:一个q分别与L个k间的Attention weights;
 #ifdef DEBUG_PRINT_EACH_STEP
   std::cerr << "qkt after softmax: " << qkt << std::endl;
@@ -931,13 +937,13 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   // shape: [B, T, D]
   // Fuse transform_0213 inside
   // attn_ctx的shape为:[B, num_head, T, dim_per_head]
-  // proj_weight的shape为:[D, D]
+  // proj_weight的shape为:[D, D]; proj_bias的shape为:[D]
   //  "Attention Is All You Need"中有:
   //    These are concatenated and once again projected, resulting in the final values
   //    The linear transformation allows the model to learn how to mix or reweight the contributions from different heads in a data-driven way
   //      transform_0213中有:对attn_ctx,交换维度1和2(H和T):[B, H, T, DH] → [B, T, H, DH],然后合并最后两维:[B, T, H, DH] → [B, T, D], 相当于将所有head的输出concatenated了(合并头)
   //      transform0213_gemm_nt_bias会将transform_0213的结果及proj_weight, proj_bias传给at::native::linear(),即做线性变换,得到最终的输出
-  auto proj = transform0213_gemm_nt_bias(  
+  auto proj = transform0213_gemm_nt_bias(
       attn_ctx, proj_weight, proj_bias, query);
 #ifndef NDEBUG
   debug_assert_shape(__LINE__, proj, {B, T, D});
@@ -946,9 +952,9 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     // weights are not needed for full transformer, so don't worry too
     // much about performance -- we implement this just to make use
     // cases that don't disable need_weights still get some speedup.
-    qkt = qkt.sum(1);
-    qkt /= num_head;
-  }
+    qkt = qkt.sum(1); // 沿head维度(dim=1)求和，将每个 head 的注意力权重合并:[B, H, T, T] → [B, T, T]
+    qkt /= num_head;  // // 再除以 head 数 → 平均值
+  }                  // shape: [B, T, D]   shape: [B, num_head, T, T]
   return std::make_tuple(std::move(proj), std::move(qkt));
 }
 std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_cuda(
