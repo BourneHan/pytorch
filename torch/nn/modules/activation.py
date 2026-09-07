@@ -1085,7 +1085,6 @@ def _is_make_fx_tracing():
     else:
         return False
 
-
 class MultiheadAttention(Module):
     r"""Allows the model to jointly attend to information from different representation subspaces.
 
@@ -1205,20 +1204,26 @@ class MultiheadAttention(Module):
             self.register_parameter("in_proj_weight", None)
         else:
             self.in_proj_weight = Parameter(
-                torch.empty((3 * embed_dim, embed_dim), **factory_kwargs)
+                torch.empty((3 * embed_dim, embed_dim), **factory_kwargs)   # in_proj_weight的shape为(3 * embed_dim, embed_dim),用于同时存储Q, K, V的权重
             )
             self.register_parameter("q_proj_weight", None)
             self.register_parameter("k_proj_weight", None)
             self.register_parameter("v_proj_weight", None)
 
         if bias:
-            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim, **factory_kwargs))
+            self.in_proj_bias = Parameter(torch.empty(3 * embed_dim, **factory_kwargs))     # 对应于in_proj_weight的融合偏置
         else:
             self.register_parameter("in_proj_bias", None)
-        self.out_proj = NonDynamicallyQuantizableLinear(
-            embed_dim, embed_dim, bias=bias, **factory_kwargs
+        self.out_proj = NonDynamicallyQuantizableLinear(        # NonDynamicallyQuantizableLinear(nn.Linear的子类)是一个Module,它内部的weight和bias是Parameter.
+            embed_dim, embed_dim, bias=bias, **factory_kwargs   # out_proj用于将注意力输出映射回原始嵌入空间
         )
+            # pytorch/torch/nn/modules/linear.py中有:
+            #   self.weight = Parameter(
+            #       torch.empty((out_features, in_features), **factory_kwargs)
+            #   )
+            #   Applies an affine linear transformation to the incoming data: :math:`y = xA^T + b`.
 
+        
         if add_bias_kv:
             self.bias_k = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
             self.bias_v = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
@@ -1269,19 +1274,19 @@ class MultiheadAttention(Module):
 
         Args:
             query: Query embeddings of shape :math:`(L, E_q)` for unbatched input, :math:`(L, N, E_q)` when ``batch_first=False``
-                or :math:`(N, L, E_q)` when ``batch_first=True``, where :math:`L` is the target sequence length,
-                :math:`N` is the batch size, and :math:`E_q` is the query embedding dimension ``embed_dim``.
-                Queries are compared against key-value pairs to produce the output.
+                or :math:`(N, L, E_q)` when ``batch_first=True``, where :math:`L` is the target sequence length,        L:target sequence Length:目标序列长度
+                :math:`N` is the batch size, and :math:`E_q` is the query embedding dimension ``embed_dim``.            N是统计学传统记号,表示"样本数量"(Number of samples),在深度学习中自然延伸为batch size。
+                Queries are compared against key-value pairs to produce the output.                                     
                 See "Attention Is All You Need" for more details.
             key: Key embeddings of shape :math:`(S, E_k)` for unbatched input, :math:`(S, N, E_k)` when ``batch_first=False``
-                or :math:`(N, S, E_k)` when ``batch_first=True``, where :math:`S` is the source sequence length,
-                :math:`N` is the batch size, and :math:`E_k` is the key embedding dimension ``kdim``.
-                See "Attention Is All You Need" for more details.
+                or :math:`(N, S, E_k)` when ``batch_first=True``, where :math:`S` is the source sequence length,        S:Source sequence length:源序列长度
+                :math:`N` is the batch size, and :math:`E_k` is the key embedding dimension ``kdim``.                   L:发起attention的一方:query侧(target); S:被attend的一方:key侧(source); 这个命名源自seq2seq
+                See "Attention Is All You Need" for more details.                                                       L/S描述的是注意力计算中的角色(query侧/key侧),与transformer的decoder/encoder组件无必然绑定;只是在cross-attention中,query恰好来自decoder(target)、key/value恰好来自encoder(source).
             value: Value embeddings of shape :math:`(S, E_v)` for unbatched input, :math:`(S, N, E_v)` when
                 ``batch_first=False`` or :math:`(N, S, E_v)` when ``batch_first=True``, where :math:`S` is the source
                 sequence length, :math:`N` is the batch size, and :math:`E_v` is the value embedding dimension ``vdim``.
                 See "Attention Is All You Need" for more details.
-            key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``
+            key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``                     用于指示key位置是否padding
                 to ignore for the purpose of attention (i.e. treat as "padding"). For unbatched `query`, shape should be :math:`(S)`.
                 Binary and float masks are supported.
                 For a binary mask, a ``True`` value indicates that the corresponding ``key`` value will be ignored for
@@ -1290,9 +1295,9 @@ class MultiheadAttention(Module):
                 Set ``need_weights=False`` to use the optimized ``scaled_dot_product_attention``
                 and achieve the best performance for MHA.
                 Default: ``True``.
-            attn_mask: If specified, a 2D or 3D mask preventing attention to certain positions. Must be of shape
-                :math:`(L, S)` or :math:`(N\cdot\text{num\_heads}, L, S)`, where :math:`N` is the batch size,
-                :math:`L` is the target sequence length, and :math:`S` is the source sequence length. A 2D mask will be
+            attn_mask: If specified, a 2D or 3D mask preventing attention to certain positions. Must be of shape          用于实现如:attention mask 
+                :math:`(L, S)` or :math:`(N\cdot\text{num\_heads}, L, S)`, where :math:`N` is the batch size,             上有:L:发起attention的一方:query侧(target); S:被attend的一方:key侧(source)
+                :math:`L` is the target sequence length, and :math:`S` is the source sequence length. A 2D mask will be         
                 broadcasted across the batch while a 3D mask allows for a different mask for each entry in the batch.
                 Binary and float masks are supported. For a binary mask, a ``True`` value indicates that the
                 corresponding position is not allowed to attend. For a float mask, the mask values will be added to
@@ -1336,10 +1341,13 @@ class MultiheadAttention(Module):
         key_padding_mask = F._canonical_mask(
             mask=key_padding_mask,
             mask_name="key_padding_mask",
-            other_type=F._none_or_dtype(attn_mask),
+            other_type=F._none_or_dtype(attn_mask),     # 检查与 attn_mask 类型一致
             other_name="attn_mask",
             target_type=query.dtype,
         )
+            # 代码只是约定俗成地选 query.dtype 作为基准
+            #   Fast path时：query与key/value dtype 必然相同,因下面有:elif query is not key or key is not value
+            #   非fast path时:dtype不同会直接报错
 
         attn_mask = F._canonical_mask(
             mask=attn_mask,
@@ -1358,7 +1366,7 @@ class MultiheadAttention(Module):
             why_not_fast_path = (
                 f"input not batched; expected query.dim() of 3 but got {query.dim()}"
             )
-        elif query is not key or key is not value:
+        elif query is not key or key is not value:  # query与key/value不相同, 则不能使用fast path
             # When lifting this restriction, don't forget to either
             # enforce that the dtypes all match or test cases where
             # they don't!
@@ -1425,7 +1433,7 @@ class MultiheadAttention(Module):
                 why_not_fast_path = "we are running make_fx tracing"
                 fast_path_blocked_by_tracing = True
             if not why_not_fast_path:
-                merged_mask, mask_type = self.merge_masks(
+                merged_mask, mask_type = self.merge_masks(      # 上有:query与key/value不相同, 则不能使用fast path
                     attn_mask, key_padding_mask, query
                 )
 
@@ -1521,6 +1529,7 @@ class MultiheadAttention(Module):
         else:
             return attn_output, attn_output_weights
 
+    # 已看完
     def merge_masks(
         self,
         attn_mask: Tensor | None,
@@ -1530,8 +1539,8 @@ class MultiheadAttention(Module):
         r"""Determine mask type and combine masks if necessary.
 
         If only one mask is provided, that mask
-        and the corresponding mask type will be returned. If both masks are provided, they will be both
-        expanded to shape ``(batch_size, num_heads, seq_len, seq_len)``, combined with logical ``or``
+        and the corresponding mask type will be returned. If both masks are provided, they will be both     两种mask的语义不同,但作用方式相同:两者最终都是对注意力分数矩阵[N, H, L, S]的逐位置修正;
+        expanded to shape ``(batch_size, num_heads, seq_len, seq_len)``, combined with logical ``or``       故可如下面:attn_mask_expanded+key_padding_mask_expanded,最后膨胀shape为(N, H, L, S);
         and mask type 2 will be returned
         Args:
             attn_mask: attention mask of shape ``(seq_len, seq_len)``, mask type 0
@@ -1550,24 +1559,26 @@ class MultiheadAttention(Module):
 
         if attn_mask is not None:
             # In this branch query can't be a nested tensor, so it has a shape
-            batch_size, seq_len, _ = query.shape
-            mask_type = 2
+            batch_size, seq_len, _ = query.shape # seq_len是query序列长度; _ = embed_dim(丢弃不用) 
+            mask_type = 2                        # 注意这里seq_len同时被当作L(query长度)和S(key长度)使用——即假设L==S. 这在fast path下是成立的:
+                                                 #   MultiheadAttention的forward中在调用merge_masks之前有:elif query is not key or key is not value
+                                                 #   TransformerEncoderLayer的forward中应也类似
 
             # Always expands attn_mask to 4D
-            if attn_mask.dim() == 3:
-                attn_mask_expanded = attn_mask.view(batch_size, -1, seq_len, seq_len)
-            else:  # attn_mask.dim() == 2:
-                attn_mask_expanded = attn_mask.view(1, 1, seq_len, seq_len).expand(
-                    batch_size, self.num_heads, -1, -1
-                )
+            if attn_mask.dim() == 3:                                                    # attn_mask部分有:Must be of shape(L,S) or (N⋅num_heads,L,S)
+                attn_mask_expanded = attn_mask.view(batch_size, -1, seq_len, seq_len)   # -1:让PyTorch自动推断该维大小; 总元素数N·H·L·S除以已知的N·L·S,推断结果为H(即[num_heads])
+            else:  # attn_mask.dim() == 2:                                                  # view仅重塑形状,其总元素数不变,需要推断缺失维度,-1是"未知待求"的占位符;
+                attn_mask_expanded = attn_mask.view(1, 1, seq_len, seq_len).expand(     # view的限制:总元素数必须不变,无法"复制"数据实现广播;
+                    batch_size, self.num_heads, -1, -1                                  # expand的限制:只能扩展已存在且大小为1的维度,不能凭空创建新维度;
+                )                                                                       # -1, -1表示:保持L和S不变(等价于写seq_len, seq_len), -1是"不扩展此维"的标记;
             merged_mask = attn_mask_expanded
 
             if key_padding_mask is not None:
                 key_padding_mask_expanded = key_padding_mask.view(
-                    batch_size, 1, 1, seq_len
-                ).expand(-1, self.num_heads, -1, -1)
-                merged_mask = attn_mask_expanded + key_padding_mask_expanded
-
+                    batch_size, 1, 1, seq_len                  # (N, S) → (N, 1, 1, S) 此处第2个1不用改为seq_len?不能,因上有:view仅重塑形状,其总元素数不变
+                ).expand(-1, self.num_heads, -1, -1)           # (N, 1, 1, S) → (N, H, 1, S) 
+                merged_mask = attn_mask_expanded + key_padding_mask_expanded    # (N, H, L, S) + (N, H, 1, S)  PyTorch广播规则:大小为1的维度自动扩展以匹配另一张量; key_padding_mask的语义是"key位置j是否padding"——与query位置i无关.
+                                                                                    # "关于broadcasting"中类似有:If one of the dimensions is 1, it can be broadcast (stretched) to match the other.
         # no attn_mask and no key_padding_mask, returns None, None
         return merged_mask, mask_type
 

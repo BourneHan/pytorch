@@ -58,7 +58,7 @@ class Linear(Module):
     On certain ROCm devices, when using float16 inputs this module will use :ref:`different precision<fp16_on_mi200>` for backward.
 
     Args:
-        in_features: size of each input sample
+        in_features: size of each input sample    # 如:in_features=512 means each token is represented by a 512-dimensional feature vector (the embedding dimension).
         out_features: size of each output sample
         bias: If set to ``False``, the layer will not learn an additive bias.
             Default: ``True``

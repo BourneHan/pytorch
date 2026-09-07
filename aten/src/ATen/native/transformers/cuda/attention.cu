@@ -900,6 +900,8 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
 	//         [0.,   0.,   0.,   0.,   -inf],
 	//         [0.,   0.,   0.,   0.,   0.  ]])
   //  qkt的行为query,列为key,使用mask以实现:位置i的query仅能attend到j<=i的key
+  //  qkt的shape为[B, num_head, T, T], 而关于mask的shape,pytorch/torch/nn/modules/activation.py中attn_mask部分有:Must be of shape(L,S) or (N⋅num_heads,L,S)
+  //    merge_masks部分有:expanded to shape (batch_size, num_heads, seq_len, seq_len)
   qkt = masked_softmax(qkt, mask, query, mask_type);
     //此函数的核心操作:
     //  如果有 mask，先应用 mask（将 masked 位置设为 -inf）
