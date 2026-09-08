@@ -712,7 +712,7 @@ __host__ std::tuple<Tensor, Tensor, Tensor> transform_bias_rescale_qkv_cuda(
 
 // 已看完
 // transformers/attention.cpp中对应有:native_multi_head_attention_cpu
-// 输出是:最终注意力输出(proj_weight投影后的最终结果) + qkt注意力权重
+// 输出:最终注意力输出(proj_weight投影后的最终结果) + qkt注意力权重
 std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     const Tensor& query,
     const Tensor& key,

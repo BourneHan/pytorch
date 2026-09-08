@@ -1225,7 +1225,7 @@ class MultiheadAttention(Module):
             #   Applies an affine linear transformation to the incoming data: :math:`y = xA^T + b`.
 
         
-        if add_bias_kv:
+        if add_bias_kv: # 给注意力一个可 attend 的空位   "Attention Is All You Need"中有:内部attention的softmax...不能输出全零。结果注意力头无法“弃权”，会把不需要的V信息混进残差流
             self.bias_k = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
             self.bias_v = Parameter(torch.empty((1, 1, embed_dim), **factory_kwargs))
         else:

@@ -6188,6 +6188,7 @@ def fold(
 #
 
 
+# 已看完
 def _in_projection_packed(
     q: Tensor,
     k: Tensor,
@@ -6204,7 +6205,7 @@ def _in_projection_packed(
             these are typically the same tensor; for encoder-decoder attention,
             k and v are typically the same tensor. (We take advantage of these
             identities for performance if they are present.) Regardless, q, k and v
-            must share a common embedding dimension; otherwise their shapes may vary.
+            must share a common embedding dimension; otherwise their shapes may vary.   ?must share a common embedding dimension?参见:下面Inputs部分及"下面_in_projection对照有"
         w: projection weights for q, k and v, packed into a single tensor. Weights
             are packed along dimension 0, in q, k, v order.
         b: optional projection biases for q, k and v, packed into a single tensor
@@ -6217,6 +6218,10 @@ def _in_projection_packed(
         - v: :math:`(..., E)` where E is the embedding dimension
         - w: :math:`(E * 3, E)` where E is the embedding dimension
         - b: :math:`E * 3` where E is the embedding dimension
+            # 下面_in_projection对照有:
+            # 	where Eq is the query embedding dimension
+            # 	where Ek is the key embedding dimension
+            # 	where Ev is the value embedding dimension
 
         Output:
         - in output list :math:`[q', k', v']`, each output tensor will have the
@@ -6226,14 +6231,14 @@ def _in_projection_packed(
     if k is v:
         if q is k:
             # self-attention
-            proj = linear(q, w, b)
+            proj = linear(q, w, b)  # linear有:Applies a linear transformation to the incoming data: :math:`y = xA^T + b`.
             # reshape to 3, E and not E, 3 is deliberate for better memory coalescing and keeping same order as chunk()
             proj = (
-                proj.unflatten(-1, (3, E))
-                .unsqueeze(0)
-                .transpose(0, -2)
-                .squeeze(-2)
-                .contiguous()
+                proj.unflatten(-1, (3, E))  # 最后一维拆成(3, E)
+                .unsqueeze(0)               # 在最前面补一个大小为1的维
+                .transpose(0, -2)           # 交换第0维(最前面补的大小为1的维)与倒数第2维(大小为3的维),把q/k/v维换到最前
+                .squeeze(-2)                # 删掉那个大小为1的维
+                .contiguous()               # 拷贝成连续内存
             )
             # pyrefly: ignore [bad-return]
             return proj[0], proj[1], proj[2]
@@ -6257,7 +6262,7 @@ def _in_projection_packed(
             # pyrefly: ignore [bad-return]
             return (q_proj, kv_proj[0], kv_proj[1])
     else:
-        w_q, w_k, w_v = w.chunk(3)
+        w_q, w_k, w_v = w.chunk(3)      # 声明有:Tensor.chunk(chunks, dim=0) → List of Tensors
         if b is None:
             b_q = b_k = b_v = None
         else:
@@ -6266,6 +6271,7 @@ def _in_projection_packed(
         return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+# 已看完
 def _in_projection(
     q: Tensor,
     k: Tensor,
@@ -6291,15 +6297,15 @@ def _in_projection(
 
     Shape:
         Inputs:
-        - q: :math:`(Qdims..., Eq)` where Eq is the query embedding dimension and Qdims are any
+        - q: :math:`(Qdims..., Eq)` where Eq is the query embedding dimension and Qdims are any     torch/nn/modules/activation.py中有:E_q is the query embedding dimension embed_dim
             number of leading dimensions.
         - k: :math:`(Kdims..., Ek)` where Ek is the key embedding dimension and Kdims are any
             number of leading dimensions.
         - v: :math:`(Vdims..., Ev)` where Ev is the value embedding dimension and Vdims are any
             number of leading dimensions.
-        - w_q: :math:`(Eq, Eq)`
-        - w_k: :math:`(Eq, Ek)`
-        - w_v: :math:`(Eq, Ev)`
+        - w_q: :math:`(Eq, Eq)`     注意力机制的计算本身要求q/k/v投影到同一维度,因: 1.点积q@k.T要求q和k的最后一维相同; 2.共同维度必须能被num_heads整除; 3.v也必须是Eq(输出投影的要求);
+        - w_k: :math:`(Eq, Ek)`     ?shape为啥(Eq, Ek)?下面linear(k, w_k, b_k)的相关linear有:Applies a linear transformation to the incoming data: :math:`y = xA^T + b`.
+        - w_v: :math:`(Eq, Ev)`     
         - b_q: :math:`(Eq)`
         - b_k: :math:`(Eq)`
         - b_v: :math:`(Eq)`
@@ -6797,8 +6803,8 @@ def multi_head_attention_forward(
             key_padding_mask = key_padding_mask.unsqueeze(0)
 
     # set up shape vars
-    tgt_len, bsz, embed_dim = query.shape
-    src_len, _, _ = key.shape
+    tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`
+    src_len, _, _ = key.shape                # 上有:key: :math:`(S, E)` or :math:`(S, N, E)`
 
     key_padding_mask = _canonical_mask(
         mask=key_padding_mask,
@@ -6862,7 +6868,7 @@ def multi_head_attention_forward(
             )
 
     #
-    # compute in-projection
+    # compute in-projection 计算输入投影
     #
     if not use_separate_proj_weight:
         if in_proj_weight is None:
@@ -6927,8 +6933,8 @@ def multi_head_attention_forward(
             raise AssertionError("bias cannot be added to static key.")
         if static_v is not None:
             raise AssertionError("bias cannot be added to static value.")
-        k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
-        v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
+        k = torch.cat([k, bias_k.repeat(1, bsz, 1)])    # (S, N, E) → (S+1, N, E): bias_k的shape(1, 1, E),其各维分别复制:1, bsz, 1次; 然后沿dim=0,cat到k;
+        v = torch.cat([v, bias_v.repeat(1, bsz, 1)])       # repeat复制出bsz份独立内存的副本(不共享存储),但autograd通过repeat的反向规则把所有副本的梯度累加回同一个bias_k/bias_v参数(MultiheadAttention中有:self.bias_k = Parameter),它随训练步数被梯度更新(repeat+cat 都是可微操作) 
         if attn_mask is not None:
             # pyrefly: ignore [bad-argument-type]
             attn_mask = pad(attn_mask, (0, 1))
