@@ -1307,10 +1307,10 @@ class MultiheadAttention(Module):
             average_attn_weights: If true, indicates that the returned ``attn_weights`` should be averaged across
                 heads. Otherwise, ``attn_weights`` are provided separately per head. Note that this flag only has an
                 effect when ``need_weights=True``. Default: ``True`` (i.e. average weights across heads)
-            is_causal: If specified, applies a causal mask as attention mask.
-                Default: ``False``.
-                Warning:
-                ``is_causal`` provides a hint that ``attn_mask`` is the
+            is_causal: If specified, applies a causal mask as attention mask.                                      普通mask可以是任意形状;    
+                Default: ``False``.                                                                                causal mask的语义是:位置i只能看j<=i位置,不能看未来位置; 故:causal mask有规律:上三角根本不用算;
+                Warning:                                                                                           对于causal mask,kernel可只计算下三角,跳过大约一半计算量; scaled_dot_product_attention调用的FlashAttention/memory-efficient SDPA这类kernel对其有特化路径(is_causal为true时);
+                ``is_causal`` provides a hint that ``attn_mask`` is the                                              而若需合并key_padding_mask,则它不再是单纯的j<=i的结构,即不能是causal mask;
                 causal mask. Providing incorrect hints can result in
                 incorrect execution, including forward and backward
                 compatibility.
@@ -1423,7 +1423,7 @@ class MultiheadAttention(Module):
                     "some Tensor argument's device is neither one of "
                     f"cpu, cuda or {torch.utils.backend_registration._privateuse1_backend_name}"
                 )
-            elif torch.is_grad_enabled() and any(
+            elif torch.is_grad_enabled() and any(           # 下面的_native_multi_head_attention偏inference
                 _arg_requires_grad(x) for x in tensor_args
             ):
                 why_not_fast_path = (
@@ -1434,13 +1434,13 @@ class MultiheadAttention(Module):
                 why_not_fast_path = "we are running make_fx tracing"
                 fast_path_blocked_by_tracing = True
             if not why_not_fast_path:
-                merged_mask, mask_type = self.merge_masks(      # 上有:query与key/value不相同, 则不能使用fast path
+                merged_mask, mask_type = self.merge_masks(      # 上有:query与key/value不相同,则不能使用fast path,也就是:下面的_native_multi_head_attention只支持self-attention
                     attn_mask, key_padding_mask, query
                 )
 
                 if self.in_proj_bias is not None and self.in_proj_weight is not None:
-                    return torch._native_multi_head_attention(
-                        query,
+                    return torch._native_multi_head_attention(  # native融合算子,里面有:query shape: [B, T, D]; 对照下面调用的multi_head_attention_forward有:query: :math:`(L, E)` or :math:`(L, N, E)`
+                        query,                                  # 不支持下面调用的multi_head_attention_forward支持的bias_k/bias_v,add_zero_attn(上有:_native_multi_head_attention偏inference)
                         key,
                         value,
                         self.embed_dim,
@@ -1474,7 +1474,7 @@ class MultiheadAttention(Module):
                 query, key, value = (x.transpose(1, 0) for x in (query, key, value))
 
         if not self._qkv_same_embed_dim:
-            attn_output, attn_output_weights = F.multi_head_attention_forward(
+            attn_output, attn_output_weights = F.multi_head_attention_forward(      # 里面有:query: :math:`(L, E)` or :math:`(L, N, E)`
                 query,
                 key,
                 value,

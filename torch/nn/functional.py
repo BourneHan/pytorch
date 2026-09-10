@@ -6649,7 +6649,7 @@ def multi_head_attention_forward(
     num_heads: int,
     in_proj_weight: Tensor | None,
     in_proj_bias: Tensor | None,
-    bias_k: Tensor | None,
+    bias_k: Tensor | None,      # bias_k/bias_v是两个可学习的"偏置token",被拼接到key/value序列的末尾,给注意力提供一个永远可attend的"默认位置"(源序列长度 S → S+1).
     bias_v: Tensor | None,
     add_zero_attn: bool,
     dropout_p: float,
@@ -6787,6 +6787,7 @@ def multi_head_attention_forward(
             average_attn_weights=average_attn_weights,
         )
 
+    # shape中是否有batch
     is_batched = _mha_shape_check(
         query, key, value, key_padding_mask, attn_mask, num_heads
     )
@@ -6796,16 +6797,16 @@ def multi_head_attention_forward(
     # batch dimension so that the output doesn't carry this temporary batch dimension.
     if not is_batched:
         # unsqueeze if the input is unbatched
-        query = query.unsqueeze(1)
+        query = query.unsqueeze(1)      # 在第1维插入一个长度为1的新维度: (L, E) ---> (L, 1, E)
         key = key.unsqueeze(1)
         value = value.unsqueeze(1)
         if key_padding_mask is not None:
-            key_padding_mask = key_padding_mask.unsqueeze(0)
+            key_padding_mask = key_padding_mask.unsqueeze(0)    # key_padding_mask: :math:`(S)` or :math:`(N, S)`
 
     # set up shape vars
-    tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`
+    tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`    is_batched时,query等会被改成batched形式
     src_len, _, _ = key.shape                # 上有:key: :math:`(S, E)` or :math:`(S, N, E)`
-
+                                             # 下面有:reshape q, k, v for multihead attention and make them batch first
     key_padding_mask = _canonical_mask(
         mask=key_padding_mask,
         mask_name="key_padding_mask",
@@ -6820,12 +6821,17 @@ def multi_head_attention_forward(
             "You may use the Transformer module method "
             "`generate_square_subsequent_mask` to create this mask."
         )
+        # 尽管下面if need_weights的else分支有:scaled_dot_product_attention中有:if is_causal: assert attn_mask is None
+        #   scaled_dot_product_attention的设计逻辑是:当is_causal=True时,SDPA会内部自动创建一个下三角掩码并应用; 因此,如果同时传入一个外部的attn_mask,就会产生歧义.
+        # 但与上面要求的attn_mask不为None也不冲突,因:
+        #   在if is_causal and key_padding_mask is None and not need_weights时,有:attn_mask = None
+        #   在if is_causal and key_padding_mask时,有:is_causal = False
 
     if is_causal and key_padding_mask is None and not need_weights:
         # when we have a kpm or need weights, we need attn_mask
         # Otherwise, we use the is_causal hint go as is_causal
         # indicator to SDPA.
-        attn_mask = None
+        attn_mask = None        # 此处会让下面调用scaled_dot_product_attention时,满足assert attn_mask is None;
     else:
         attn_mask = _canonical_mask(
             mask=attn_mask,
@@ -6837,8 +6843,8 @@ def multi_head_attention_forward(
         )
 
         if key_padding_mask is not None:
-            # We have the attn_mask, and use that to merge kpm into it.
-            # Turn off use of is_causal hint, as the merged mask is no
+            # We have the attn_mask, and use that to merge kpm into it.      
+            # Turn off use of is_causal hint, as the merged mask is no      torch/nn/modules/activation.py中有:若需合并key_padding_mask,则它不再是单纯的j<=i的结构,即不能是causal mask;
             # longer causal.
             is_causal = False
 
@@ -6929,18 +6935,18 @@ def multi_head_attention_forward(
 
     # add bias along batch dimension (currently second)
     if bias_k is not None and bias_v is not None:
-        if static_k is not None:
+        if static_k is not None:    # 见下面:decoder的cross-attention时,encoder的输出是固定的
             raise AssertionError("bias cannot be added to static key.")
         if static_v is not None:
             raise AssertionError("bias cannot be added to static value.")
-        k = torch.cat([k, bias_k.repeat(1, bsz, 1)])    # (S, N, E) → (S+1, N, E): bias_k的shape(1, 1, E),其各维分别复制:1, bsz, 1次; 然后沿dim=0,cat到k;
+        k = torch.cat([k, bias_k.repeat(1, bsz, 1)])    # bias_k的shape(1, 1, E),其各维分别复制:1, bsz, 1次; 然后沿dim=0,cat到k; : (S, N, E) → (S+1, N, E): 
         v = torch.cat([v, bias_v.repeat(1, bsz, 1)])       # repeat复制出bsz份独立内存的副本(不共享存储),但autograd通过repeat的反向规则把所有副本的梯度累加回同一个bias_k/bias_v参数(MultiheadAttention中有:self.bias_k = Parameter),它随训练步数被梯度更新(repeat+cat 都是可微操作) 
         if attn_mask is not None:
             # pyrefly: ignore [bad-argument-type]
-            attn_mask = pad(attn_mask, (0, 1))
-        if key_padding_mask is not None:
+            attn_mask = pad(attn_mask, (0, 1))  # 最后一维右侧补1个元素,最后一维左侧补0个元素;补的是默认值0: (..., L, S) → (..., L, S+1)
+        if key_padding_mask is not None:        #   补0:不影响注意力分数→允许attend;  补-inf:softmax后权重为0→屏蔽
             # pyrefly: ignore [bad-argument-type]
-            key_padding_mask = pad(key_padding_mask, (0, 1))
+            key_padding_mask = pad(key_padding_mask, (0, 1))    # (N, S) → (N, S+1)
     else:
         if bias_k is not None:
             raise AssertionError("bias_k is set but bias_v is None")
@@ -6948,14 +6954,14 @@ def multi_head_attention_forward(
             raise AssertionError("bias_v is set but bias_k is None")
 
     #
-    # reshape q, k, v for multihead attention and make them batch first
+    # reshape q, k, v for multihead attention and make them batch first        q的shape为(L, N, E); k/v的shape为(S, N, E)
     #
     # pyrefly: ignore [bad-argument-type, no-matching-overload]
     q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
-    if static_k is None:
+    if static_k is None:    # "Encoder vs decoder"中有:decoder的cross-attention时,encoder的输出是固定的,每步重新对encoder的输出做k/v投影是浪费,故可缓存起来(inference时更是可长期缓存起来)使用;
         # pyrefly: ignore [bad-argument-type, no-matching-overload]
         k = k.view(k.shape[0], bsz * num_heads, head_dim).transpose(0, 1)
-    else:
+    else:   # 注意:即使传了static_k,前面的_in_projection仍然会执行,而此处的TODO注释就是说这个
         # TODO finish disentangling control flow so we don't do in-projections when statics are passed
         if static_k.size(0) != bsz * num_heads:
             raise AssertionError(
@@ -7027,11 +7033,11 @@ def multi_head_attention_forward(
     # (deep breath) calculate attention and out projection
     #
 
-    if need_weights:
+    if need_weights:    # else分支中调用的scaled_dot_product_attention不返回attention weights
         _B, _Nt, E = q.shape
         q_scaled = q * math.sqrt(1.0 / float(E))
 
-        if is_causal and attn_mask is None:
+        if is_causal and attn_mask is None:     # 应该走不到这里,因上面已有:if is_causal and attn_mask is None?no,其下面有:attn_mask = None
             raise AssertionError("FIXME: is_causal not implemented for need_weights")
 
         if attn_mask is not None:
@@ -7059,7 +7065,7 @@ def multi_head_attention_forward(
         if average_attn_weights:
             attn_output_weights = attn_output_weights.mean(dim=1)
 
-        if not is_batched:
+        if not is_batched:  # 对应于上面的if not is_batched处理
             # squeeze the output if input was unbatched
             attn_output = attn_output.squeeze(1)
             attn_output_weights = attn_output_weights.squeeze(0)
@@ -7075,7 +7081,7 @@ def multi_head_attention_forward(
                 attn_mask = attn_mask.view(bsz, num_heads, -1, src_len)
 
         # pyrefly: ignore [bad-argument-type]
-        q = q.view(bsz, num_heads, tgt_len, head_dim)
+        q = q.view(bsz, num_heads, tgt_len, head_dim)   # 上有:q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
         # pyrefly: ignore [bad-argument-type]
         k = k.view(bsz, num_heads, src_len, head_dim)
         # pyrefly: ignore [bad-argument-type]
