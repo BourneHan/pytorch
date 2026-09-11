@@ -6716,11 +6716,11 @@ def multi_head_attention_forward(
 
     Shape:
         Inputs:
-        - query: :math:`(L, E)` or :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is
+        - query: :math:`(L, E)` or :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is   下面有:reshape q, k, v for multihead attention and make them batch first
           the embedding dimension.
-        - key: :math:`(S, E)` or :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is
+        - key: :math:`(S, E)` or :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is    torch/nn/modules/activation.py的MultiheadAttention.forward中_qkv_same_embed_dim为false时,E为kdim;
           the embedding dimension.
-        - value: :math:`(S, E)` or :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is
+        - value: :math:`(S, E)` or :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is   torch/nn/modules/activation.py的MultiheadAttention.forward中_qkv_same_embed_dim为false时,E为vdim;
           the embedding dimension.
         - key_padding_mask: :math:`(S)` or :math:`(N, S)` where N is the batch size, S is the source sequence length.
           If a FloatTensor is provided, it will be directly added to the value.
@@ -7042,7 +7042,7 @@ def multi_head_attention_forward(
             raise AssertionError("FIXME: is_causal not implemented for need_weights")   # 即使attn_mask不为None, 这个分支也没再用is_causal啊????
 
         if attn_mask is not None:
-            attn_output_weights = torch.baddbmm(
+            attn_output_weights = torch.baddbmm(    # 计算注意力分数矩阵,并将掩码attn_mask以加性方式融合到分数中
                 attn_mask, q_scaled, k.transpose(-2, -1)
             )
         else:
@@ -7051,7 +7051,7 @@ def multi_head_attention_forward(
             del q_scaled, k
         attn_output_weights = softmax(attn_output_weights, dim=-1)
         if dropout_p > 0.0:
-            attn_output_weights = dropout(attn_output_weights, p=dropout_p)
+            attn_output_weights = dropout(attn_output_weights, p=dropout_p) # 注意是在attn_output_weights执行的dropout
 
         attn_output = torch.bmm(attn_output_weights, v)
         if not torch.jit.is_scripting():
@@ -7068,8 +7068,8 @@ def multi_head_attention_forward(
 
         if not is_batched:  # 对应于上面的if not is_batched处理
             # squeeze the output if input was unbatched
-            attn_output = attn_output.squeeze(1)
-            attn_output_weights = attn_output_weights.squeeze(0)
+            attn_output = attn_output.squeeze(1)        # 上有:attn_output: :math:`(L, E)` or :math:`(L, N, E)`
+            attn_output_weights = attn_output_weights.squeeze(0)    # 上有:shape :math:`(L, S)` when input is unbatched or :math:`(N, L, S)` / shape :math:`(num_heads, L, S)` when input is unbatched or :math:`(N, num_heads, L, S)`
         return attn_output, attn_output_weights
     else:
         # attn_mask can be either (L,S) or (N*num_heads, L, S)
@@ -7103,7 +7103,7 @@ def multi_head_attention_forward(
         attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
         if not is_batched:
             # squeeze the output if input was unbatched
-            attn_output = attn_output.squeeze(1)
+            attn_output = attn_output.squeeze(1)    # 上有:attn_output: :math:`(L, E)` or :math:`(L, N, E)`
         return attn_output, None
 
 
