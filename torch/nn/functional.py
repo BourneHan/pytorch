@@ -6618,6 +6618,7 @@ def _canonical_mask(
     return mask
 
 
+# 已看完
 def _none_or_dtype(input: Tensor | None) -> DType | None:
     if input is None:
         return None
@@ -6649,7 +6650,7 @@ def multi_head_attention_forward(
     num_heads: int,
     in_proj_weight: Tensor | None,
     in_proj_bias: Tensor | None,
-    bias_k: Tensor | None,      # bias_k/bias_v是两个可学习的"偏置token",被拼接到key/value序列的末尾,给注意力提供一个永远可attend的"默认位置"(源序列长度 S → S+1).
+    bias_k: Tensor | None,
     bias_v: Tensor | None,
     add_zero_attn: bool,
     dropout_p: float,
@@ -6695,7 +6696,7 @@ def multi_head_attention_forward(
             leads to a significant performance degradation.*
         attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
             the batches while a 3D mask allows to specify a different mask for the entries of each batch.
-        is_causal: If specified, applies a causal mask as attention mask, and ignores
+        is_causal: If specified, applies a causal mask as attention mask, and ignores    应是指下面的if is_causal and key_padding_mask is None and not need_weights时的attn_mask = None 
             attn_mask for computing scaled dot product attention.
             Default: ``False``.
             .. warning::
@@ -6756,7 +6757,7 @@ def multi_head_attention_forward(
         out_proj_weight,
         out_proj_bias,
     )
-    if has_torch_function(tens_ops):
+    if has_torch_function(tens_ops):    # 兼容性钩子:PyTorch的__torch_function__协议的标准实现模式,核心作用是让自定义的Tensor子类(Tensor subclass)能够拦截并重写multi_head_attention_forward的行为
         return handle_torch_function(
             multi_head_attention_forward,
             tens_ops,
@@ -6828,7 +6829,7 @@ def multi_head_attention_forward(
         #   在if is_causal and key_padding_mask时,有:is_causal = False
 
     if is_causal and key_padding_mask is None and not need_weights:
-        # when we have a kpm or need weights, we need attn_mask
+        # when we have a kpm or need weights, we need attn_mask     ???不太明白这些注释是啥意思???
         # Otherwise, we use the is_causal hint go as is_causal
         # indicator to SDPA.
         attn_mask = None        # 此处会让下面调用scaled_dot_product_attention时,满足assert attn_mask is None;
@@ -6954,7 +6955,7 @@ def multi_head_attention_forward(
             raise AssertionError("bias_v is set but bias_k is None")
 
     #
-    # reshape q, k, v for multihead attention and make them batch first        q的shape为(L, N, E); k/v的shape为(S, N, E)
+    # reshape q, k, v for multihead attention and make them batch first    q的shape为(L, N, E)--->(N*num_heads, L, head_dim); k/v的shape为(S, N, E)--->(N*num_heads, S, head_dim)
     #
     # pyrefly: ignore [bad-argument-type, no-matching-overload]
     q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
@@ -6993,7 +6994,7 @@ def multi_head_attention_forward(
         k = torch.cat(
             # pyrefly: ignore [no-matching-overload]
             [k, torch.zeros(zero_attn_shape, dtype=k.dtype, device=k.device)],
-            dim=1,
+            dim=1,  # 沿dim=1,cat到k;
         )
         v = torch.cat(
             # pyrefly: ignore [no-matching-overload]
@@ -7002,10 +7003,10 @@ def multi_head_attention_forward(
         )
         if attn_mask is not None:
             # pyrefly: ignore [bad-argument-type]
-            attn_mask = pad(attn_mask, (0, 1))
+            attn_mask = pad(attn_mask, (0, 1))  # 与上面bias_k时的处理一样
         if key_padding_mask is not None:
             # pyrefly: ignore [bad-argument-type]
-            key_padding_mask = pad(key_padding_mask, (0, 1))
+            key_padding_mask = pad(key_padding_mask, (0, 1))    # 与上面bias_v时的处理一样
 
     # update source sequence length after adjustments
     src_len = k.size(1)
@@ -7038,7 +7039,7 @@ def multi_head_attention_forward(
         q_scaled = q * math.sqrt(1.0 / float(E))
 
         if is_causal and attn_mask is None:     # 应该走不到这里,因上面已有:if is_causal and attn_mask is None?no,其下面有:attn_mask = None
-            raise AssertionError("FIXME: is_causal not implemented for need_weights")
+            raise AssertionError("FIXME: is_causal not implemented for need_weights")   # 即使attn_mask不为None, 这个分支也没再用is_causal啊????
 
         if attn_mask is not None:
             attn_output_weights = torch.baddbmm(
