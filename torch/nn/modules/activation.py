@@ -1109,7 +1109,14 @@ class MultiheadAttention(Module):
 
     In addition to support for the new ``scaled_dot_product_attention()``
     function, for speeding up Inference, MHA will use
-    fastpath inference with support for Nested Tensors, iff:
+    fastpath inference with support for Nested Tensors, iff:    fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention(原生C++算子,独立的,更激进的优化路径)    ---_native_multi_head_attention偏inference
+                                                                    aten\src\ATen\native\transformers\cuda\attention.cu的native_multi_head_attention_cuda中:
+                                                                    在(backend == sdp::SDPBackend::flash_attention || backend == sdp::SDPBackend::efficient_attention || backend == sdp::SDPBackend::cudnn_attention)时会调用at::scaled_dot_product_attention(at::native::scaled_dot_product_attention)  
+                                                                        只允许SDPA在能真正带来大幅加速且安全的后端上启用. 如果SDPA只能走math,那还不如直接用旧的经过充分验证的bmm+softmax+bmm路径  
+                                                                当不满足fastpath条件时,MultiheadAttention.forward会调用F.multi_head_attention_forward,其在条件允许(need_weights为false)时会调用scaled_dot_product_attention来计算注意力
+                                                                    torch.nn.functional.scaled_dot_product_attention通常简称SDPA, 它是Python层的公共API/入口函数;
+                                                                        参见"关于native_functions.yaml"中有:这个operator提供function-style Python API...at::native::scaled_dot_product_attention(aten/src/ATen/native/transformers/attention.cpp中)
+                                                                        SDPBackend::cudnn_attention/SDPBackend::flash_attention/SDPBackend::efficient_attention/SDPBackend::overrideable/SDPBackend::math是SDPA可调度的底层后端实现;
 
     - self attention is being computed (i.e., ``query``, ``key``, and ``value`` are the same tensor).
     - inputs are batched (3D) with ``batch_first==True``
