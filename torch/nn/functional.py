@@ -6806,9 +6806,10 @@ def multi_head_attention_forward(
         value = value.unsqueeze(1)
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.unsqueeze(0)    # key_padding_mask: :math:`(S)` or :math:`(N, S)`
+        # 对于attn_mask的处理,见下面if attn_mask is not None:部分
 
     # set up shape vars
-    tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`    is_batched时,query等会被改成batched形式
+    tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`    上面if not is_batched时,query等会被改成batched形式
     src_len, _, _ = key.shape                # 上有:key: :math:`(S, E)` or :math:`(S, N, E)`
                                              # 下面有:reshape q, k, v for multihead attention and make them batch first
     key_padding_mask = _canonical_mask(
@@ -6867,7 +6868,7 @@ def multi_head_attention_forward(
         )
     if use_separate_proj_weight:
         # allow MHA to have different embedding dimensions when separate projection weights are used
-        if key.shape[:2] != value.shape[:2]:
+        if key.shape[:2] != value.shape[:2]:    # shape为:(S, N, E); 而2代表取前两个维度
             raise AssertionError(
                 f"key's sequence and batch dims {key.shape[:2]} do not match value's {value.shape[:2]}"
             )
@@ -6885,6 +6886,8 @@ def multi_head_attention_forward(
             raise AssertionError(
                 "use_separate_proj_weight is False but in_proj_weight is None"
             )
+        # pytorch/aten/src/ATen/native/transformers/cuda/attention.cu中native_multi_head_attention_cuda类似有:
+        #   论文概念:每个head独立投影; 代码实现:融合投影qkv_weight的shape:[3 * D, D],1次大矩阵乘法,减少kernel launch,计算效率提升了数倍.
         q, k, v = _in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
     else:
         if q_proj_weight is None:
@@ -6914,20 +6917,21 @@ def multi_head_attention_forward(
             b_k,
             b_v,
         )
+    # compute in-projection之后, query的shape:(L, N, embed_dim); key/value的shape:(S, N, embed_dim)
 
     # prep attention mask
 
     if attn_mask is not None:
         # ensure attn_mask's dim is 3
         if attn_mask.dim() == 2:
-            correct_2d_size = (tgt_len, src_len)
+            correct_2d_size = (tgt_len, src_len)    # 上有:2D mask :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
             if attn_mask.shape != correct_2d_size:
                 raise RuntimeError(
                     f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}."
-                )
-            attn_mask = attn_mask.unsqueeze(0)
-        elif attn_mask.dim() == 3:
-            correct_3d_size = (bsz * num_heads, tgt_len, src_len)
+                )                               # 上关于attn_mask有:A 2D mask will be broadcasted for all the batches
+            attn_mask = attn_mask.unsqueeze(0)  # 在第0维插入一个长度为1的新维度:(L, S) ---> (1, L, S); 后续使用时自动将(1, L, S)广播; ---按需广播、避免物化
+        elif attn_mask.dim() == 3:              #   若显式地扩展为(num_heads, L, S),需要在内存中实际分配并复制数据(内存占用成倍增加).  而下面的torch.baddbmm(input, batch1, batch2)的实现又要求:attn_mask必须是3D张量;
+            correct_3d_size = (bsz * num_heads, tgt_len, src_len)   # 上有:3D mask :math:`(N*num_heads, L, S)` where N is the batch size, L is the target sequence length
             if attn_mask.shape != correct_3d_size:
                 raise RuntimeError(
                     f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
@@ -6937,7 +6941,7 @@ def multi_head_attention_forward(
                 f"attn_mask's dimension {attn_mask.dim()} is not supported"
             )
 
-    # add bias along batch dimension (currently second)
+    # add bias along batch dimension (currently second)   ---应是指下面的repeat(1, bsz, 1)
     if bias_k is not None and bias_v is not None:
         if static_k is not None:    # 见下面:decoder的cross-attention时,encoder的输出是固定的
             raise AssertionError("bias cannot be added to static key.")
@@ -6956,8 +6960,8 @@ def multi_head_attention_forward(
             raise AssertionError("bias_k is set but bias_v is None")
         if bias_v is not None:
             raise AssertionError("bias_v is set but bias_k is None")
-
-    #
+        
+    #   pytorch/aten/src/ATen/native/transformers/cuda/attention.cu中native_multi_head_attention_cuda类似有: 拆头:将shape为[B, T, D]的q,k,v按照head拆开:[B, T, D]--->[B, T, H, D/H]--->[B, H, T, D/H]
     # reshape q, k, v for multihead attention and make them batch first    q的shape为(L, N, E)--->(N*num_heads, L, head_dim); k/v的shape为(S, N, E)--->(N*num_heads, S, head_dim)
     #
     # pyrefly: ignore [bad-argument-type, no-matching-overload]
@@ -6991,7 +6995,8 @@ def multi_head_attention_forward(
             )
         v = static_v
 
-    # add zero attention along batch dimension (now first)
+    # q的shape为(N*num_heads, L, head_dim); k/v的shape为(N*num_heads, S, head_dim)
+    # add zero attention along batch dimension (now first) ---此注释貌似不太准确,应是下面的沿dim=1
     if add_zero_attn:
         zero_attn_shape = (bsz * num_heads, 1, head_dim)
         k = torch.cat(
