@@ -6696,11 +6696,11 @@ def multi_head_attention_forward(
             leads to a significant performance degradation.*
         attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
             the batches while a 3D mask allows to specify a different mask for the entries of each batch.
-        is_causal: If specified, applies a causal mask as attention mask, and ignores    应是指下面的if is_causal and key_padding_mask is None and not need_weights时的attn_mask = None 
-            attn_mask for computing scaled dot product attention.
-            Default: ``False``.
+        is_causal: If specified, applies a causal mask as attention mask, and ignores
+            attn_mask for computing scaled dot product attention.       应是指下面的if is_causal and key_padding_mask is None and not need_weights时的attn_mask = None 
+            Default: ``False``.                                             下面还有:is_causal = False
             .. warning::
-                is_causal is provides a hint that the attn_mask is the
+                is_causal is provides a hint that the attn_mask is the  ???在if need_weights:分支中:is_causal为true且attn_mask不为None时,后续在此分支中也没用到is_causal
                 causal mask.Providing incorrect hints can result in
                 incorrect execution, including forward and backward
                 compatibility.
@@ -6715,7 +6715,7 @@ def multi_head_attention_forward(
 
 
     Shape:
-        Inputs:
+        Inputs:                                                                                                         native_multi_head_attention_cuda中有: query shape: [B, T, D] 	// key和value的shape也是和query一样
         - query: :math:`(L, E)` or :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is   下面有:reshape q, k, v for multihead attention and make them batch first
           the embedding dimension.
         - key: :math:`(S, E)` or :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is    torch/nn/modules/activation.py的MultiheadAttention.forward中_qkv_same_embed_dim为false时,E为kdim;
@@ -6745,6 +6745,9 @@ def multi_head_attention_forward(
           :math:`(N, L, S)`, where :math:`N` is the batch size, :math:`L` is the target sequence length, and
           :math:`S` is the source sequence length. If ``average_attn_weights=False``, returns attention weights per
           head of shape :math:`(num_heads, L, S)` when input is unbatched or :math:`(N, num_heads, L, S)`.
+            native_multi_head_attention_cuda中在return时有:
+                shape: [B, T, D]   shape: [B, num_head, T, T]
+                符合:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
     """
     tens_ops = (
         query,
@@ -7088,7 +7091,7 @@ def multi_head_attention_forward(
         # pyrefly: ignore [bad-argument-type]
         v = v.view(bsz, num_heads, src_len, head_dim)
 
-        attn_output = scaled_dot_product_attention(
+        attn_output = scaled_dot_product_attention(     # scaled_dot_product_attention中有:if is_causal: assert attn_mask is None
             q, k, v, attn_mask, dropout_p, is_causal
         )
         # Free q, k, v and their backing projection storage before the

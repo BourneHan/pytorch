@@ -1377,7 +1377,7 @@ class MultiheadAttention(Module):
             why_not_fast_path = (
                 f"input not batched; expected query.dim() of 3 but got {query.dim()}"
             )
-        elif query is not key or key is not value:  # query与key/value不相同, 则不能使用fast path
+        elif query is not key or key is not value:  # query与key/value不相同,则不能使用fast path
             # When lifting this restriction, don't forget to either
             # enforce that the dtypes all match or test cases where
             # they don't!

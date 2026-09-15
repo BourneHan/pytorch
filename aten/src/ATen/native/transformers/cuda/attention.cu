@@ -955,6 +955,7 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     qkt = qkt.sum(1); // 沿head维度(dim=1)求和，将每个 head 的注意力权重合并:[B, H, T, T] → [B, T, T]
     qkt /= num_head;  // // 再除以 head 数 → 平均值
   }                  // shape: [B, T, D]   shape: [B, num_head, T, T]
+                     // 符合:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
   return std::make_tuple(std::move(proj), std::move(qkt));
 }
 std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_cuda(
