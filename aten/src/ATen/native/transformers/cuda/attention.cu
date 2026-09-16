@@ -825,6 +825,8 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
       // 调用SDPA(Scaled Dot-Product Attention)(FlashAttention等融合kernel)
       auto y = at::scaled_dot_product_attention(
           chunks[0], chunks[1], chunks[2], mask, 0.0, false, std::nullopt);
+      // torch/nn/functional.py中scaled_dot_product_attention部分有:output (Tensor): Attention output; shape :math:`(N, ..., Hq, L, Ev)`.
+	    //  ???Hq???
 
       // 合并头:[B, H, T, DH](y的shape) → [B, T, D]
       auto past_sdp = y.transpose(1, 2).reshape({x_size_0, -1, embed_dim});

@@ -6518,7 +6518,7 @@ scaled_dot_product_attention = _add_docstr(
     """,
 )
 
-
+# 已看完
 def _mha_shape_check(
     query: Tensor,
     key: Tensor,
@@ -6642,6 +6642,7 @@ def _check_key_padding_mask(
     )
 
 
+# 已看完
 def multi_head_attention_forward(
     query: Tensor,
     key: Tensor,
@@ -6807,6 +6808,9 @@ def multi_head_attention_forward(
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.unsqueeze(0)    # key_padding_mask: :math:`(S)` or :math:`(N, S)`
         # 对于attn_mask的处理,见下面if attn_mask is not None:部分
+        # 对于attn_mask,
+        #   上有:A 2D mask will be broadcasted for all the batches while a 3D mask allows to specify a different mask for the entries of each batch.
+        #   _mha_shape_check中要求:query为2维时:attn_mask可为2/3维, 且attn_mask为3维时,其shape必为(num_heads, query.shape[0], key.shape[0])
 
     # set up shape vars
     tgt_len, bsz, embed_dim = query.shape    # 上有:query: :math:`(L, E)` or :math:`(L, N, E)`    上面if not is_batched时,query等会被改成batched形式
@@ -7019,19 +7023,19 @@ def multi_head_attention_forward(
     # update source sequence length after adjustments
     src_len = k.size(1)
 
-    # merge key padding and attention masks
-    if key_padding_mask is not None:
+    # merge key padding and attention masks ---合并key padding mask到attention mask
+    if key_padding_mask is not None:    # shape为(1, S)/(N, S)
         if not torch.jit.is_scripting() and not torch.jit.is_tracing():
             _check_key_padding_mask(key_padding_mask, src_len, bsz)
 
-        key_padding_mask = (
+        key_padding_mask = (        # key_padding_mask的shape从(N, S)扩展为(N*num_heads, 1, S)
             key_padding_mask.view(bsz, 1, 1, src_len)
-            .expand(-1, num_heads, -1, -1)
+            .expand(-1, num_heads, -1, -1)      # expand的限制:只能扩展已存在且大小为1的维度,不能凭空创建新维度; -1是"不扩展此维"的标记;
             .reshape(bsz * num_heads, 1, src_len)
         )
-        if attn_mask is None:
+        if attn_mask is None:   
             attn_mask = key_padding_mask
-        else:
+        else:   # attn_mask的shape为:(1, L, S)/(N*num_heads, L, S)
             attn_mask = attn_mask + key_padding_mask
 
     # adjust dropout probability
@@ -7041,38 +7045,42 @@ def multi_head_attention_forward(
     #
     # (deep breath) calculate attention and out projection
     #
-
+    # q的shape为(N*num_heads, L, head_dim); k/v的shape为(N*num_heads, S, head_dim)
     if need_weights:    # else分支中调用的scaled_dot_product_attention不返回attention weights
         _B, _Nt, E = q.shape
-        q_scaled = q * math.sqrt(1.0 / float(E))
+        q_scaled = q * math.sqrt(1.0 / float(E))    # E是d_k
 
-        if is_causal and attn_mask is None:     # 应该走不到这里,因上面已有:if is_causal and attn_mask is None?no,其下面有:attn_mask = None
+        if is_causal and attn_mask is None:     # 应该走不到这里,因上面已有:if is_causal and attn_mask is None?no,其下面还有:attn_mask = None
             raise AssertionError("FIXME: is_causal not implemented for need_weights")   # 即使attn_mask不为None, 这个分支也没再用is_causal啊????
 
-        if attn_mask is not None:
-            attn_output_weights = torch.baddbmm(    # 计算注意力分数矩阵,并将掩码attn_mask以加性方式融合到分数中
+        if attn_mask is not None:                   # 计算注意力分数矩阵,并将掩码attn_mask以加性方式融合到分数中
+            attn_output_weights = torch.baddbmm(    # Performs a batch matrix-matrix product of matrices in batch1 and batch2. input is added to the final result.
                 attn_mask, q_scaled, k.transpose(-2, -1)
             )
         else:
-            attn_output_weights = torch.bmm(q_scaled, k.transpose(-2, -1))
+            attn_output_weights = torch.bmm(q_scaled, k.transpose(-2, -1))  # Performs a batch matrix-matrix product of matrices
+        # attn_output_weights的shape为(N*num_heads, L, S)
+        # "Attention Is All You Need"中有:矩阵相乘的结果矩阵的一行表示:一个q分别与L个k的dot product;
         if not torch.jit.is_scripting():
             del q_scaled, k
-        attn_output_weights = softmax(attn_output_weights, dim=-1)
+        attn_output_weights = softmax(attn_output_weights, dim=-1) # "Attention Is All You Need"中有:结果矩阵的一行表示:一个q分别与L个k间的Attention weights;
         if dropout_p > 0.0:
             attn_output_weights = dropout(attn_output_weights, p=dropout_p) # 注意是在attn_output_weights执行的dropout
+        # attn_output_weights的shape仍为(N*num_heads, L, S)
 
-        attn_output = torch.bmm(attn_output_weights, v)
+        attn_output = torch.bmm(attn_output_weights, v) # attn_output的shape为(N*num_heads, L, head_dim) "Attention Is All You Need"中有:矩阵相乘的结果矩阵的一行表示:一个q用L个v表示出来的维度为dv的vector
         if not torch.jit.is_scripting():
             del v
 
-        attn_output = attn_output.transpose(0, 1).reshape(tgt_len * bsz, embed_dim)
-        attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
-        attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
+        attn_output = attn_output.transpose(0, 1).reshape(tgt_len * bsz, embed_dim) # "Attention Is All You Need"中有: These are concatenated and once again projected, resulting in the final values
+        attn_output = linear(attn_output, out_proj_weight, out_proj_bias) # out_proj_weight的shape为(embed_dim, embed_dim); out_proj_bias的shape为(embed_dim,)
+        attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1)) # "Attention Is All You Need"中有:The linear transformation allows the model to learn how to mix or reweight the contributions from different heads in a data-driven way  
+        # attn_output 的shape为(tgt_len, bsz, embed_dim)
 
         # optionally average attention weights over heads
-        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
+        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len) # attn_output_weights的shape变为(N, num_heads, L, S)
         if average_attn_weights:
-            attn_output_weights = attn_output_weights.mean(dim=1)
+            attn_output_weights = attn_output_weights.mean(dim=1) # attn_output_weights的shape变为(N, L, S)
 
         if not is_batched:  # 对应于上面的if not is_batched处理
             # squeeze the output if input was unbatched
@@ -7089,8 +7097,9 @@ def multi_head_attention_forward(
             else:
                 attn_mask = attn_mask.view(bsz, num_heads, -1, src_len)
 
+        # q的shape为(N*num_heads, L, head_dim); k/v的shape为(N*num_heads, S, head_dim)
         # pyrefly: ignore [bad-argument-type]
-        q = q.view(bsz, num_heads, tgt_len, head_dim)   # 上有:q = q.view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
+        q = q.view(bsz, num_heads, tgt_len, head_dim) 
         # pyrefly: ignore [bad-argument-type]
         k = k.view(bsz, num_heads, src_len, head_dim)
         # pyrefly: ignore [bad-argument-type]
@@ -7099,16 +7108,19 @@ def multi_head_attention_forward(
         attn_output = scaled_dot_product_attention(     # scaled_dot_product_attention中有:if is_causal: assert attn_mask is None
             q, k, v, attn_mask, dropout_p, is_causal
         )
-        # Free q, k, v and their backing projection storage before the
+        # torch/nn/functional.py中scaled_dot_product_attention部分有:output (Tensor): Attention output; shape :math:`(N, ..., Hq, L, Ev)`.
+	    #  ???Hq???
+
+        # Free q, k, v and their backing projection storage before the      在恰当的时机删除所有引用，主动促使内存回收，从而提升了大模型训练和推理时的内存效率
         # reshape() below allocates.  In self-attention the three tensors are
         # views of a single packed projection, so releasing all references
         # here lets the allocator reclaim that memory immediately.
         if not torch.jit.is_scripting():
             del q, k, v
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(bsz * tgt_len, embed_dim)
+        attn_output = attn_output.permute(2, 0, 1, 3).reshape(bsz * tgt_len, embed_dim) # attn_output的shape(N, num_heads, L, Ev)--->(L, N, num_heads, Ev)--->(N * L, E)
 
-        attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
-        attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
+        attn_output = linear(attn_output, out_proj_weight, out_proj_bias)   # out_proj_weight的shape为(embed_dim, embed_dim); out_proj_bias的shape为(embed_dim,)
+        attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))   # attn_output的shape为(L, N, E)
         if not is_batched:
             # squeeze the output if input was unbatched
             attn_output = attn_output.squeeze(1)    # 上有:attn_output: :math:`(L, E)` or :math:`(L, N, E)`
