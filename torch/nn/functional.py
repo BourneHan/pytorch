@@ -6748,7 +6748,7 @@ def multi_head_attention_forward(
           head of shape :math:`(num_heads, L, S)` when input is unbatched or :math:`(N, num_heads, L, S)`.
             native_multi_head_attention_cuda中在return时有:
                 shape: [B, T, D]   shape: [B, num_head, T, T]
-                符合:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
+                符合"Attention Is All You Need"中:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
     """
     tens_ops = (
         query,

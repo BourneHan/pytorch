@@ -823,6 +823,10 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
       chunks[2] = (chunks[2].view({x_size_0, -1, num_head, dim_per_head}))
                       .transpose(1, 2);
       // 调用SDPA(Scaled Dot-Product Attention)(FlashAttention等融合kernel)
+      // at::scaled_dot_product_attention的注释部分有:
+      //  Two types of masks are supported.
+      //    A boolean mask where a value of True indicates that the element *should* take part in attention.
+      //    A float mask of the same type as query, key, value that is added to the attention score.
       auto y = at::scaled_dot_product_attention(
           chunks[0], chunks[1], chunks[2], mask, 0.0, false, std::nullopt);
       // torch/nn/functional.py中scaled_dot_product_attention部分有:output (Tensor): Attention output; shape :math:`(N, ..., Hq, L, Ev)`.
@@ -911,6 +915,11 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
   //  qkt的行为query,列为key,使用mask以实现:位置i的query仅能attend到j<=i的key
   //  qkt的shape为[B, num_head, T, T], 而关于mask的shape,pytorch/torch/nn/modules/activation.py中attn_mask部分有:Must be of shape(L,S) or (N⋅num_heads,L,S)
   //    merge_masks部分有:expanded to shape (batch_size, num_heads, seq_len, seq_len)
+  // masked_softmax中有:
+	//    if (attn_mask && attn_mask->dtype() != at::kBool) {
+	//      attn_mask = attn_mask->to(at::kBool); // 将注意力掩码转换为布尔类型
+	//    }
+  //    但其继续调用的masked_softmax_cuda中有:output = at::softmax(input.masked_fill(mask, -std::numeric_limits<scalar_t>::infinity()), dim);
   qkt = masked_softmax(qkt, mask, query, mask_type);
     //此函数的核心操作:
     //  如果有mask，先应用mask(将masked位置设为-inf): qkt = qkt.masked_fill(mask, -std::numeric_limits<float>::infinity());
@@ -957,7 +966,7 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
     qkt = qkt.sum(1); // 沿head维度(dim=1)求和，将每个 head 的注意力权重合并:[B, H, T, T] → [B, T, T]
     qkt /= num_head;  // // 再除以 head 数 → 平均值
   }                  // shape: [B, T, D]   shape: [B, num_head, T, T]
-                     // 符合:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
+                     // 符合"Attention Is All You Need"中:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
   return std::make_tuple(std::move(proj), std::move(qkt));
 }
 std::tuple<Tensor, Tensor, Tensor, Tensor, c10::SymInt, c10::SymInt, Tensor, Tensor, Tensor> _scaled_dot_product_flash_attention_cuda(

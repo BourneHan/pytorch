@@ -1268,6 +1268,7 @@ class MultiheadAttention(Module):
 
         super().__setstate__(state)
 
+    # 已看完
     def forward(
         self,
         query: Tensor,
@@ -1293,17 +1294,17 @@ class MultiheadAttention(Module):
                 or :math:`(N, S, E_k)` when ``batch_first=True``, where :math:`S` is the source sequence length,        S:Source sequence length:源序列长度
                 :math:`N` is the batch size, and :math:`E_k` is the key embedding dimension ``kdim``.                   L:发起attention的一方:query侧(target); S:被attend的一方:key侧(source); 这个命名源自seq2seq
                 See "Attention Is All You Need" for more details.                                                       L/S描述的是注意力计算中的角色(query侧/key侧),与transformer的decoder/encoder组件无必然绑定;只是在cross-attention中,query恰好来自decoder(target)、key/value恰好来自encoder(source).
-            value: Value embeddings of shape :math:`(S, E_v)` for unbatched input, :math:`(S, N, E_v)` when
-                ``batch_first=False`` or :math:`(N, S, E_v)` when ``batch_first=True``, where :math:`S` is the source
+            value: Value embeddings of shape :math:`(S, E_v)` for unbatched input, :math:`(S, N, E_v)` when             
+                ``batch_first=False`` or :math:`(N, S, E_v)` when ``batch_first=True``, where :math:`S` is the source   torch/nn/functional.py中有:注意力机制的计算本身要求q/k/v投影到同一维度,因: 1.点积q@k.T要求q和k的最后一维相同; 2.共同维度必须能被num_heads整除; 3.v也必须是Eq(输出投影的要求);
                 sequence length, :math:`N` is the batch size, and :math:`E_v` is the value embedding dimension ``vdim``.
                 See "Attention Is All You Need" for more details.
-            key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``                     用于指示key位置是否padding
+            key_padding_mask: If specified, a mask of shape :math:`(N, S)` indicating which elements within ``key``     用于指示key位置是否padding
                 to ignore for the purpose of attention (i.e. treat as "padding"). For unbatched `query`, shape should be :math:`(S)`.
                 Binary and float masks are supported.
                 For a binary mask, a ``True`` value indicates that the corresponding ``key`` value will be ignored for
                 the purpose of attention. For a float mask, it will be directly added to the corresponding ``key`` value.
             need_weights: If specified, returns ``attn_output_weights`` in addition to ``attn_outputs``.
-                Set ``need_weights=False`` to use the optimized ``scaled_dot_product_attention``
+                Set ``need_weights=False`` to use the optimized ``scaled_dot_product_attention``                         scaled_dot_product_attention不返回attention weights
                 and achieve the best performance for MHA.
                 Default: ``True``.
             attn_mask: If specified, a 2D or 3D mask preventing attention to certain positions. Must be of shape          用于实现如:attention mask 
@@ -1321,13 +1322,13 @@ class MultiheadAttention(Module):
                 Default: ``False``.                                                                                causal mask的语义是:位置i只能看j<=i位置,不能看未来位置; 故:causal mask有规律:上三角根本不用算;
                 Warning:                                                                                           对于causal mask,kernel可只计算下三角,跳过大约一半计算量; scaled_dot_product_attention调用的FlashAttention/memory-efficient SDPA这类kernel对其有特化路径(is_causal为true时);
                 ``is_causal`` provides a hint that ``attn_mask`` is the                                              而若需合并key_padding_mask,则它不再是单纯的j<=i的结构,即不能是causal mask;
-                causal mask. Providing incorrect hints can result in
+                causal mask. Providing incorrect hints can result in                                               看torch/nn/functional.py中multi_head_attention_forward的is_causal注释的解释及疑问部分
                 incorrect execution, including forward and backward
                 compatibility.
 
         Outputs:
             - **attn_output** - Attention outputs of shape :math:`(L, E)` when input is unbatched,          # E = E_q = embed_dim; E_k/E_v仅在指定了不同的kdim/vdim时才与它们不同,而投影层都会先把key/value映射到embed_dim;
-              :math:`(L, N, E)` when ``batch_first=False`` or :math:`(N, L, E)` when ``batch_first=True``,
+              :math:`(L, N, E)` when ``batch_first=False`` or :math:`(N, L, E)` when ``batch_first=True``,  # 符合"Attention Is All You Need"中:all sub-layers in the model, as well as the embedding layers, produce outputs of dimension =512.  
               where :math:`L` is the target sequence length, :math:`N` is the batch size, and :math:`E` is the
               embedding dimension ``embed_dim``.
             - **attn_output_weights** - Only returned when ``need_weights=True``. If ``average_attn_weights=True``,
@@ -1342,11 +1343,12 @@ class MultiheadAttention(Module):
         why_not_fast_path = ""
         if (
             (attn_mask is not None and torch.is_floating_point(attn_mask))
-            or (key_padding_mask is not None)
+            or (key_padding_mask is not None)                               # Python中and的优先级高于or
             and torch.is_floating_point(key_padding_mask)
-        ):
+        ):  # 用户直接传入的任意浮点掩码:值可能是任意浮点数,语义不明确; 下面布尔掩码经_canonical_mask转换得到的浮点掩码:其值只有-inf(原True位置)和0(原False位置)
             why_not_fast_path = "floating-point masks are not supported for fast path."
 
+        # 是否有多批
         is_batched = query.dim() == 3
 
         key_padding_mask = F._canonical_mask(
@@ -1386,7 +1388,7 @@ class MultiheadAttention(Module):
             why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_bias ({self.in_proj_bias.dtype}) don't match"
         elif self.in_proj_weight is None:
             why_not_fast_path = "in_proj_weight was None"
-        elif query.dtype != self.in_proj_weight.dtype:
+        elif query.dtype != self.in_proj_weight.dtype:  # fast path使用的原生融合算子不会在内部做自动类型转换(因为类型转换会带来额外开销,违背fast path的性能目标),所以必须要求query和in_proj_weight的dtype完全一致
             # this case will fail anyway, but at least they'll get a useful error message.
             why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_weight ({self.in_proj_weight.dtype}) don't match"
         elif self.training:
@@ -1403,7 +1405,7 @@ class MultiheadAttention(Module):
             why_not_fast_path = "add_zero_attn was enabled"
         elif not self._qkv_same_embed_dim:
             why_not_fast_path = "_qkv_same_embed_dim was not True"
-        elif query.is_nested and (
+        elif query.is_nested and (  # 上有:# query与key/value不相同,则不能使用fast path
             key_padding_mask is not None or attn_mask is not None
         ):
             why_not_fast_path = (
@@ -1434,7 +1436,7 @@ class MultiheadAttention(Module):
                     f"cpu, cuda or {torch.utils.backend_registration._privateuse1_backend_name}"
                 )
             elif torch.is_grad_enabled() and any(           # 下面的_native_multi_head_attention偏inference
-                _arg_requires_grad(x) for x in tensor_args
+                _arg_requires_grad(x) for x in tensor_args  # 在any(...)中,_arg_requires_grad(x) for x in tensor_args就是生成器表达式,只是括号被省略了
             ):
                 why_not_fast_path = (
                     "grad is enabled and at least one of query or the "
@@ -1451,8 +1453,8 @@ class MultiheadAttention(Module):
                 if self.in_proj_bias is not None and self.in_proj_weight is not None:
                     return torch._native_multi_head_attention(  # native融合算子,里面有:query shape: [B, T, D]; 对照下面调用的multi_head_attention_forward有:query: :math:`(L, E)` or :math:`(L, N, E)`
                         query,                                  # 不支持下面调用的multi_head_attention_forward支持的bias_k/bias_v,add_zero_attn(上有:_native_multi_head_attention偏inference)
-                        key,
-                        value,
+                        key,                                    # 要求:inputs are batched (3D) with batch_first==True
+                        value,                                  # aten/src/ATen/native/transformers/cuda/attention.cu的native_multi_head_attention_cuda有返回值:shape: [B, T, D]   shape: [B, num_head, T, T]
                         self.embed_dim,
                         self.num_heads,
                         self.in_proj_weight,
@@ -1482,7 +1484,11 @@ class MultiheadAttention(Module):
                     value = key
             else:
                 query, key, value = (x.transpose(1, 0) for x in (query, key, value))
-
+                # (query, key, value) 是一个元组，包含当前三个变量的引用
+                # for x in ... 依次遍历这个元组
+                # (x.transpose(1, 0) for x in (query, key, value)):可迭代的生成器对象 
+                # query, key, value = () 可迭代对象解包
+                
         if not self._qkv_same_embed_dim:
             attn_output, attn_output_weights = F.multi_head_attention_forward(      # 里面有:query: :math:`(L, E)` or :math:`(L, N, E)`
                 query,
@@ -1531,8 +1537,12 @@ class MultiheadAttention(Module):
                 average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
             )
+        # torch/nn/functional.py中multi_head_attention_forward的返回值的shape为
+        #     attn_output: :math:`(L, E)` or :math:`(L, N, E)`
+        #     shape :math:`(L, S)` when input is unbatched or :math:`(N, L, S)` / shape :math:`(num_heads, L, S)` when input is unbatched or :math:`(N, num_heads, L, S)`
+        
         if self.batch_first and is_batched:
-            attn_output = attn_output.transpose(1, 0)
+            attn_output = attn_output.transpose(1, 0)   # 调整attn_output的shape以和query/key/value的batch_first对齐
             if fast_path_blocked_by_tracing:
                 # Keep the traced slowpath layout aligned with eager fastpath.
                 attn_output = attn_output.contiguous()
