@@ -1090,12 +1090,12 @@ class MultiheadAttention(Module):
 
     This MultiheadAttention layer implements the original architecture described
     in the `Attention Is All You Need <https://arxiv.org/abs/1706.03762>`_ paper. The
-    intent of this layer is as a reference implementation for foundational understanding
+    intent of this layer is as a reference implementation for foundational understanding        ???this layer???
     and thus it contains only limited features relative to newer architectures.
     Given the fast pace of innovation in transformer-like architectures, we recommend
     exploring this `tutorial <https://pytorch.org/tutorials/intermediate/transformer_building_blocks.html>`_
-    to build efficient layers from building blocks in core or using higher
-    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.
+    to build efficient layers from building blocks in core or using higher              "building blocks in core"应是指如: torch.nested,scaled_dot_product_attention; using higher应是recommend的宾语
+    level libraries from the `PyTorch Ecosystem <https://landscape.pytorch.org/>`_.     https://landscape.pytorch.org/中有: Hugging Face Transformers
 
     Multi-Head Attention is defined as:
 
@@ -1109,7 +1109,7 @@ class MultiheadAttention(Module):
 
     In addition to support for the new ``scaled_dot_product_attention()``
     function, for speeding up Inference, MHA will use
-    fastpath inference with support for Nested Tensors, iff:    fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention(原生C++算子,独立的,更激进的优化路径)    ---_native_multi_head_attention偏inference
+    fastpath inference with support for Nested Tensors, iff:    fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention(原生C++算子,独立的,更激进的优化路径)  ---_native_multi_head_attention偏inference
                                                                     aten\src\ATen\native\transformers\cuda\attention.cu的native_multi_head_attention_cuda中:
                                                                     在(backend == sdp::SDPBackend::flash_attention || backend == sdp::SDPBackend::efficient_attention || backend == sdp::SDPBackend::cudnn_attention)时会调用at::scaled_dot_product_attention(at::native::scaled_dot_product_attention)  
                                                                         只允许SDPA在能真正带来大幅加速且安全的后端上启用. 如果SDPA只能走math,那还不如直接用旧的经过充分验证的bmm+softmax+bmm路径  
@@ -1141,12 +1141,12 @@ class MultiheadAttention(Module):
         num_heads: Number of parallel attention heads. Note that ``embed_dim`` will be split
             across ``num_heads`` (i.e. each head will have dimension ``embed_dim // num_heads``).
         dropout: Dropout probability on ``attn_output_weights``. Default: ``0.0`` (no dropout).
-        bias: If specified, adds bias to input / output projection layers. Default: ``True``.
+        bias: If specified, adds bias to input / output projection layers. Default: ``True``.                   bias若为true,则在输入和输出投影层中添加偏置
         add_bias_kv: If specified, adds bias to the key and value sequences at dim=0. Default: ``False``.
         add_zero_attn: If specified, adds a new batch of zeros to the key and value sequences at dim=1.
             Default: ``False``.
-        kdim: Total number of features for keys. Default: ``None`` (uses ``kdim=embed_dim``).
-        vdim: Total number of features for values. Default: ``None`` (uses ``vdim=embed_dim``).
+        kdim: Total number of features for keys. Default: ``None`` (uses ``kdim=embed_dim``).                   下有:self.kdim = kdim if kdim is not None else embed_dim
+        vdim: Total number of features for values. Default: ``None`` (uses ``vdim=embed_dim``).                 下有:self.vdim = vdim if vdim is not None else embed_dim
         batch_first: If ``True``, then the input and output tensors are provided
             as (batch, seq, feature). Default: ``False`` (seq, batch, feature).
 
@@ -1154,18 +1154,18 @@ class MultiheadAttention(Module):
 
         >>> # xdoctest: +SKIP
         >>> multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
-        >>> attn_output, attn_output_weights = multihead_attn(query, key, value)
+        >>> attn_output, attn_output_weights = multihead_attn(query, key, value)            nn.Module.__call__: 1 执行必要的hook逻辑; 2 调用forward(query, key, value);
 
     .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:
          https://arxiv.org/abs/2205.14135
 
     """
 
-    __constants__ = ["batch_first"]
-    bias_k: torch.Tensor | None
+    __constants__ = ["batch_first"]     # 告诉TorchScript编译器,batch_first这个属性在模块的整个生命周期内是固定不变的常量,从而允许编译器对它进行更激进的优化
+    bias_k: torch.Tensor | None         # 类的__annotations__字典加一条记录:{"bias_k": torch.Tensor | None},供静态类型检查器,IDE和文档工具使用
     bias_v: torch.Tensor | None
 
-    def __init__(
+    def __init__(   # 构造函数
         self,
         embed_dim,
         num_heads,
@@ -1184,7 +1184,7 @@ class MultiheadAttention(Module):
                 f"embed_dim and num_heads must be greater than 0,"
                 f" got embed_dim={embed_dim} and num_heads={num_heads} instead"
             )
-        factory_kwargs = {"device": device, "dtype": dtype}
+        factory_kwargs = {"device": device, "dtype": dtype} # 字典
         super().__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
@@ -1200,7 +1200,7 @@ class MultiheadAttention(Module):
 
         if not self._qkv_same_embed_dim:
             self.q_proj_weight = Parameter(
-                torch.empty((embed_dim, embed_dim), **factory_kwargs)
+                torch.empty((embed_dim, embed_dim), **factory_kwargs)   # **字典表示把字典中的每个键值对拆开,作为独立的关键字参数传给函数; factory_kwargs里的键"device"和"dtype"正好对应torch.empty的两个关键字参数
             )
             self.k_proj_weight = Parameter(
                 torch.empty((embed_dim, self.kdim), **factory_kwargs)

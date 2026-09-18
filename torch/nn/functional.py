@@ -7065,7 +7065,7 @@ def multi_head_attention_forward(
             del q_scaled, k
         attn_output_weights = softmax(attn_output_weights, dim=-1) # "Attention Is All You Need"中有:结果矩阵的一行表示:一个q分别与L个k间的Attention weights;
         if dropout_p > 0.0:
-            attn_output_weights = dropout(attn_output_weights, p=dropout_p) # 注意是在attn_output_weights执行的dropout
+            attn_output_weights = dropout(attn_output_weights, p=dropout_p) # 注意是在attn_output_weights执行的dropout; torch/nn/modules/activation.py中有:dropout: Dropout probability on ``attn_output_weights``.
         # attn_output_weights的shape仍为(N*num_heads, L, S)
 
         attn_output = torch.bmm(attn_output_weights, v) # attn_output的shape为(N*num_heads, L, head_dim) "Attention Is All You Need"中有:矩阵相乘的结果矩阵的一行表示:一个q用L个v表示出来的维度为dv的vector
