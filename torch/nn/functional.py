@@ -6344,6 +6344,7 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+# 通过_add_docstr将文档字符串附加到torch._C._nn.scaled_dot_product_attention上. 因此,两者本质上是同一个函数的不同入口:Python层提供用户友好的接口,C++层负责实际调度和执行
 scaled_dot_product_attention = _add_docstr(
     torch._C._nn.scaled_dot_product_attention,
     r"""scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
