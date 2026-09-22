@@ -1165,6 +1165,7 @@ class MultiheadAttention(Module):
     bias_k: torch.Tensor | None         # 类的__annotations__字典加一条记录:{"bias_k": torch.Tensor | None},供静态类型检查器,IDE和文档工具使用
     bias_v: torch.Tensor | None
 
+    # 已看完
     def __init__(   # 构造函数
         self,
         embed_dim,
@@ -1198,8 +1199,8 @@ class MultiheadAttention(Module):
         if self.head_dim * num_heads != self.embed_dim:
             raise AssertionError("embed_dim must be divisible by num_heads")
 
-        if not self._qkv_same_embed_dim:
-            self.q_proj_weight = Parameter(
+        if not self._qkv_same_embed_dim:    # _qkv_same_embed_dim表示query,key,value的embedding维度是否相同,若不同则需要分别定义q_proj_weight, k_proj_weight, v_proj_weight;
+            self.q_proj_weight = Parameter( # 尽管multi_head_attention_forward中有:compute in-projection之后, query的shape:(L, N, embed_dim); key/value的shape:(S, N, embed_dim)
                 torch.empty((embed_dim, embed_dim), **factory_kwargs)   # **字典表示把字典中的每个键值对拆开,作为独立的关键字参数传给函数; factory_kwargs里的键"device"和"dtype"正好对应torch.empty的两个关键字参数
             )
             self.k_proj_weight = Parameter(
@@ -1223,14 +1224,16 @@ class MultiheadAttention(Module):
             self.register_parameter("in_proj_bias", None)
         self.out_proj = NonDynamicallyQuantizableLinear(        # NonDynamicallyQuantizableLinear(nn.Linear的子类)是一个Module,它内部的weight和bias是Parameter.
             embed_dim, embed_dim, bias=bias, **factory_kwargs   # out_proj用于将注意力输出映射回原始嵌入空间
-        )
+        )                                                       # 实现"Attention Is All You Need"中有:The linear transformation allows the model to learn how to mix or reweight the contributions from different heads in a data-driven way  
             # pytorch/torch/nn/modules/linear.py中有:
             #   self.weight = Parameter(
             #       torch.empty((out_features, in_features), **factory_kwargs)
             #   )
             #   self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
             #   Applies an affine linear transformation to the incoming data: :math:`y = xA^T + b`.
-
+            # out_proj中的参数会被MultiheadAttention.parameters()迭代器访问到. 因PyTorch nn.Module的自动注册机制:
+            #   当你执行self.out_proj=NonDynamicallyQuantizableLinear(...)时,nn.Module的__setattr__方法会检测到被赋值的对象是一个nn.Module的实例,它会自动将这个子模块注册到当前模块中. 
+            #   而MultiheadAttention.parameters()会递归访问所有子模块中的参数. 
         
         if add_bias_kv: 
             # bias_k/bias_v是两个可学习的Parameter(增加模型容量),其是全局的,与输入无关的,被拼接到key/value序列的末尾,使模型可以去关注一个抽象的全局偏置信息(源序列长度 S → S+1).

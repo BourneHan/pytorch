@@ -27,7 +27,7 @@ class _ParameterMeta(torch._C._TensorMeta):
         return super().__instancecheck__(instance)
 
 
-class Parameter(torch.Tensor, metaclass=_ParameterMeta):
+class Parameter(torch.Tensor, metaclass=_ParameterMeta):    # 基类为torch.Tensor; metaclass为_ParameterMeta
     r"""A kind of Tensor that is to be considered a module parameter.
 
     Parameters are :class:`~torch.Tensor` subclasses, that have a
