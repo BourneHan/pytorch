@@ -1249,18 +1249,26 @@ class MultiheadAttention(Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
+        # "关于Dot product attention"有:in most Transformer implementations, the projection matrices W_Q,W_K,W_V are initialized using Xavier (Glorot) initialization
+        #   根本原因应是在于保证"this √dₖ scaling in the attention mechanism of Transformers"中的"q及k的均值为0而方差为1"    
         if self._qkv_same_embed_dim:
-            xavier_uniform_(self.in_proj_weight)
-        else:
+            xavier_uniform_(self.in_proj_weight)    # 初始化视角认为in_proj_weight是一个:d--->3d大线性变换；forward时的数学视角又可以把它解释为三个:d--->d的线性变换; 
+        else:                                       # Hugging Face Transformers如BERT把Q、K、V定义成三个独立的nn.Linear,且其初始化采用W ~ N(0,0.02^2)的方式.
             xavier_uniform_(self.q_proj_weight)
             xavier_uniform_(self.k_proj_weight)
             xavier_uniform_(self.v_proj_weight)
 
+        ?self.out_proj.weight是怎么初始化的?
+
         if self.in_proj_bias is not None:
-            constant_(self.in_proj_bias, 0.0)
+            constant_(self.in_proj_bias, 0.0)   # 初始化为0
             constant_(self.out_proj.bias, 0.0)
         if self.bias_k is not None:
-            xavier_normal_(self.bias_k)
+            xavier_normal_(self.bias_k) # 把bias_k改成合理尺度的Xavier uniform,通常并不会从数学原理上破坏MHA
+            # xavier_normal_更像是一种保守的小随机初始化:让这个额外的learnable K/V一开始不会特别强烈地干扰正常attention,然后训练过程中再学习到合适的值;
+            #    "this √dₖ scaling in the attention mechanism of Transformers"中有:
+            #        the elements of q and k are zero-mean and unit variance...So the sum over dk terms has variance:Var(q⋅k)=dk 即:Var(ki​)=O(1)
+            #    设d=embed_dim,bias_k的shape为(1,1,d),而由PyTorch的fan计算得到:fanin=d,fanout=d; 由Xavier Normal给出σ=sqrt(2/(d+d))=1/sqrt(d), 故bias_k[i] ~ N(0,1/d);   ---注意bias_k不需经过projection
         if self.bias_v is not None:
             xavier_normal_(self.bias_v)
 

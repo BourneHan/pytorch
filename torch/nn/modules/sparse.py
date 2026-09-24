@@ -176,8 +176,8 @@ class Embedding(Module):
 
         self.sparse = sparse
 
-    def reset_parameters(self) -> None:
-        init.normal_(self.weight)
+    def reset_parameters(self) -> None: # Hugging Face Transformers中是最广泛使用的实现,其_init_weights方法通常将Embedding权重初始化为均值为0,标准差为initializer_range(默认0.02)的正态分布(详见https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/modeling_utils.py#7中的_init_weights)
+        init.normal_(self.weight)   # 使用标准正态分布初始化; 
         self._fill_padding_idx_with_zero()
 
     def _fill_padding_idx_with_zero(self) -> None:
