@@ -139,7 +139,7 @@ class Linear(Module):
         """
         return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
-
+# 如果一个注意力层被不正确量化(比如量化参数缺失,类型不匹配),在TorchScript脚本化时会报一个很难理解的错误A. 为了避免这个晦涩错误,PyTorch专门加了一个类来绕过它. 这侧面说明量化虽然能加速,但配置不当会带来调试困难.
 # This class exists solely to avoid triggering an obscure error when scripting
 # an improperly quantized attention layer. See this issue for details:
 # https://github.com/pytorch/pytorch/issues/58969
