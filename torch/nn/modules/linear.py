@@ -114,6 +114,7 @@ class Linear(Module):
             self.register_parameter("bias", None)
         self.reset_parameters()
 
+    # 已看完
     def reset_parameters(self) -> None:
         """
         Resets parameters based on their initialization used in ``__init__``.
@@ -127,7 +128,7 @@ class Linear(Module):
         if self.bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            init.uniform_(self.bias, -bound, bound)
+            init.uniform_(self.bias, -bound, bound)     #使用U(-1/sqrt(fan_in),1/sqrt(fan_in))初始化
 
     def forward(self, input: Tensor) -> Tensor:
         """
