@@ -9,11 +9,11 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.init import xavier_uniform_
 
-from .activation import MultiheadAttention
+from .activation import MultiheadAttention  # .表示相对导入（relative import），指从当前包（package）中导入模块，即等价于from torch.nn.modules.activation import MultiheadAttention
 from .container import ModuleList
 from .dropout import Dropout
 from .linear import Linear
-from .module import Module
+from .module import Module                  # Base class for all neural network modules
 from .normalization import LayerNorm
 
 
@@ -315,11 +315,13 @@ class Transformer(Module):
         """
         return _generate_square_subsequent_mask(sz, dtype=dtype, device=device)
 
+    # 已看完
     def _reset_parameters(self) -> None:
         r"""Initialize parameters in the transformer model."""
-        for p in self.parameters():
-            if p.dim() > 1:
-                xavier_uniform_(p)
+        for p in self.parameters(): # self.parameters()返回的是nn.Parameter对象; nn.Parameter继承自torch.Tensor; 
+            if p.dim() > 1: # 所有Tensor都有dim()方法; Transformer的所有p.dim()>1的parameter都被用xavier_uniform_重新初始化,如:Attention层的W_Q,W_K,W_V,W_O;FFN层的W1,W2
+                xavier_uniform_(p) 
+            # 而所有p.dim()<=1的parameter则保留原本的初始化,如:Attention及FFN层的上述weights对应的bias(MultiheadAttention的_reset_parameters将Attention中的bias初始化为0,FFN使用U(-1/sqrt(fan_in),1/sqrt(fan_in))初始化); LayerNorm的γ,β分别初始化为1,0;
 
 
 class TransformerEncoder(Module):
@@ -1199,10 +1201,11 @@ class TransformerDecoderLayer(Module):
         return self.dropout3(x)
 
 
+# 已看完
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
-    return ModuleList([copy.deepcopy(module) for i in range(N)])
-
+    return ModuleList([copy.deepcopy(module) for i in range(N)])    # Lists may be constructed in several ways:Using a list comprehension: [x for x in iterable]
+                                                                    # range(stop)
 
 def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
     if activation == "relu":

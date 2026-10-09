@@ -118,9 +118,11 @@ class Linear(Module):
         """
         Resets parameters based on their initialization used in ``__init__``.
         """
-        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
-        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
-        # https://github.com/pytorch/pytorch/issues/57109
+        # nn.Linear只是借用了kaiming_uniform_()这个函数来产生一个特定尺度的均匀分布(把a=√5作为参数传进去).这里的a、gain是Kaiming初始化公式里的参数.   ---参见"关于Weight Initialization"中的"对于LeakyReLU来说"部分
+        # a=√5在这里让最终分布变成uniform(-1/sqrt(in_features), 1/sqrt(in_features))
+        # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with     uniform(-1/sqrt(in_features), 1/sqrt(in_features))是Linear的历史默认初始化方案,保证了一个非常重要的性质:Var(W)=1/(3*in_features)=O(1/in_features),而使输出维持在合理的,不会随维度爆炸的尺度;
+        # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see         部分参考"关于Weight Initialization"中"若仅满足上述条件,则为LeCun uniform" 
+        # https://github.com/pytorch/pytorch/issues/57109                           
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
