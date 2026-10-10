@@ -32,7 +32,7 @@ class _DropoutNd(Module):
         return f"p={self.p}, inplace={self.inplace}"
 
 
-class Dropout(_DropoutNd):
+class Dropout(_DropoutNd): # tensor中的每个元素都独立地(element-wise)以概率p被置零
     r"""During training, randomly zeroes some of the elements of the input tensor with probability :attr:`p`.
 
     The zeroed elements are chosen independently for each forward call and are sampled from a Bernoulli distribution.

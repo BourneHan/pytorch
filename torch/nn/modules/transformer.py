@@ -321,7 +321,7 @@ class Transformer(Module):
         for p in self.parameters(): # self.parameters()返回的是nn.Parameter对象; nn.Parameter继承自torch.Tensor; 
             if p.dim() > 1: # 所有Tensor都有dim()方法; Transformer的所有p.dim()>1的parameter都被用xavier_uniform_重新初始化,如:Attention层的W_Q,W_K,W_V,W_O;FFN层的W1,W2
                 xavier_uniform_(p) 
-            # 而所有p.dim()<=1的parameter则保留原本的初始化,如:Attention及FFN层的上述weights对应的bias(MultiheadAttention的_reset_parameters将Attention中的bias初始化为0,FFN使用U(-1/sqrt(fan_in),1/sqrt(fan_in))初始化); LayerNorm的γ,β分别初始化为1,0;
+            # 而所有p.dim()<=1的parameter则保留原本的初始化,如:Attention及FFN层的上述weights对应的bias(MultiheadAttention的_reset_parameters将Attention中的bias初始化为0,FFN使用U(-1/sqrt(fan_in),1/sqrt(fan_in))初始化bias); LayerNorm的γ,β分别初始化为1,0;
 
 
 class TransformerEncoder(Module):
@@ -679,8 +679,8 @@ class TransformerEncoderLayer(Module):
 
     TransformerEncoderLayer can handle either traditional torch.tensor inputs,
     or Nested Tensor inputs.  Derived classes are expected to similarly accept
-    both input formats.  (Not all combinations of inputs are currently
-    supported by TransformerEncoderLayer while Nested Tensor is in prototype
+    both input formats.  (Not all combinations of inputs are currently          虽然TransformerEncoderLayer声称可以处理Nested Tensor,但如TransformerEncoderLayer.forward的所有“输入张量类 +可选参数”的组合并不是都能正常工作
+    supported by TransformerEncoderLayer while Nested Tensor is in prototype    https://docs.pytorch.org/docs/2.13/nested.html中有: Warning Nested tensors are not currently under active development. Use at your own risk.
     state.)
 
     If you are implementing a custom layer, you may derive it either from
@@ -697,10 +697,10 @@ class TransformerEncoderLayer(Module):
         dropout: the dropout value (default=0.1).
         activation: the activation function of the intermediate layer, can be a string
             ("relu" or "gelu") or a unary callable. Default: relu
-        layer_norm_eps: the eps value in layer normalization components (default=1e-5).
+        layer_norm_eps: the eps value in layer normalization components (default=1e-5).      "关于LayerNorm"中的ϵ: small constant to prevent division by zero.
         batch_first: If ``True``, then the input and output tensors are provided
             as (batch, seq, feature). Default: ``False`` (seq, batch, feature).
-        norm_first: if ``True``, layer norm is done prior to attention and feedforward
+        norm_first: if ``True``, layer norm is done prior to attention and feedforward          ???到此为止???
             operations, respectively. Otherwise it's done after. Default: ``False`` (after).
         bias: If set to ``False``, ``Linear`` and ``LayerNorm`` layers will not learn an additive
             bias. Default: ``True``.
@@ -766,14 +766,14 @@ class TransformerEncoderLayer(Module):
         self.self_attn = MultiheadAttention(
             d_model,
             nhead,
-            dropout=dropout,
+            dropout=dropout,    # torch/nn/functional.py的multi_head_attention_forward中有:在softmax之后应用了dropout;
             bias=bias,
             batch_first=batch_first,
             **factory_kwargs,
         )
         # Implementation of Feedforward model
         self.linear1 = Linear(d_model, dim_feedforward, bias=bias, **factory_kwargs)
-        self.dropout = Dropout(dropout)
+        self.dropout = Dropout(dropout)         # Dropout无状态,故:若self.dropout,self.dropout1,self.dropout2共用一个实例时,计算结果等价；但分开实例能保证独立配置p;
         self.linear2 = Linear(dim_feedforward, d_model, bias=bias, **factory_kwargs)
 
         self.norm_first = norm_first
@@ -970,7 +970,7 @@ class TransformerEncoderLayer(Module):
         key_padding_mask: Tensor | None,
         is_causal: bool = False,
     ) -> Tensor:
-        x = self.self_attn(
+        x = self.self_attn(     # 上有:torch/nn/functional.py的multi_head_attention_forward中有:在softmax之后应用了dropout;
             x,
             x,
             x,
