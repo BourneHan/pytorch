@@ -535,7 +535,7 @@ class TransformerEncoder(Module):
 
             if (not why_not_sparsity_fast_path) and (src_key_padding_mask is not None):
                 convert_to_nested = True
-                output = torch._nested_tensor_from_mask(
+                output = torch._nested_tensor_from_mask(  ???为啥这个函数的调用使用why_not_sparsity_fast_path来判断???
                     output, src_key_padding_mask.logical_not(), mask_check=False
                 )
                 src_key_padding_mask_for_layers = None
@@ -555,7 +555,7 @@ class TransformerEncoder(Module):
             output = output.to_padded_tensor(0.0, src.size())
 
         if self.norm is not None:
-            output = self.norm(output)
+            output = self.norm(output)  # self.norm主要是为norm_first=True(pre-norm)时设计的; 在post-norm时它确实接近冗余(与最后一层的norm2功能重叠);
 
         return output
 
@@ -660,7 +660,7 @@ class TransformerDecoder(Module):
             )
 
         if self.norm is not None:
-            output = self.norm(output)
+            output = self.norm(output) # 类似于TransformerEncoder中的:self.norm主要是为norm_first=True(pre-norm)时设计的; 在post-norm时它确实接近冗余(与最后一层的norm2功能重叠);
 
         return output
 
@@ -700,9 +700,9 @@ class TransformerEncoderLayer(Module):
         layer_norm_eps: the eps value in layer normalization components (default=1e-5).      "关于LayerNorm"中的ϵ: small constant to prevent division by zero.
         batch_first: If ``True``, then the input and output tensors are provided
             as (batch, seq, feature). Default: ``False`` (seq, batch, feature).
-        norm_first: if ``True``, layer norm is done prior to attention and feedforward          ???到此为止???
+        norm_first: if ``True``, layer norm is done prior to attention and feedforward        "关于Post-LayerNorm与Pre-LayerNorm"
             operations, respectively. Otherwise it's done after. Default: ``False`` (after).
-        bias: If set to ``False``, ``Linear`` and ``LayerNorm`` layers will not learn an additive
+        bias: If set to ``False``, ``Linear`` and ``LayerNorm`` layers will not learn an additive   还涉及MultiheadAttention层
             bias. Default: ``True``.
 
     Examples:
@@ -722,12 +722,12 @@ class TransformerEncoderLayer(Module):
         `FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`_ if all of the following
         conditions are met:
 
-        - Either autograd is disabled (using ``torch.inference_mode`` or ``torch.no_grad``) or no tensor
+        - Either autograd is disabled (using ``torch.inference_mode`` or ``torch.no_grad``) or no tensor    对应下面的elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args)的逻辑取反
           argument ``requires_grad``
-        - training is disabled (using ``.eval()``)
+        - training is disabled (using ``.eval()``)              对应下面的elif self.training的逻辑取反;   "推理"只描述模型被使用这一事实,不排斥梯度:梯度可以作为分析工具,还可以驱动真正的参数更新; 建图由grad模式+requires_grad在前向时隐式控制; backward由用户显式调用触发; 参数更新由optimizer.step()独立完成;
         - batch_first is ``True`` and the input is batched (i.e., ``src.dim() == 3``)
         - activation is one of: ``"relu"``, ``"gelu"``, ``torch.functional.relu``, or ``torch.functional.gelu``
-        - at most one of ``src_mask`` and ``src_key_padding_mask`` is passed
+        - at most one of ``src_mask`` and ``src_key_padding_mask`` is passed          过时了  
         - if src is a `NestedTensor <https://pytorch.org/docs/stable/nested.html>`_, neither ``src_mask``
           nor ``src_key_padding_mask`` is passed
         - the two ``LayerNorm`` instances have a consistent ``eps`` value (this will naturally be the case
@@ -740,9 +740,29 @@ class TransformerEncoderLayer(Module):
         returned, and an additional speedup proportional to the fraction of the input that
         is padding can be expected.
 
-        .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:
+        .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:  torch/nn/modules/activation.py中MultiheadAttention部分有:FlashAttention是指at::native::scaled_dot_product_attention中的SDPBackend::flash_attention实现
          https://arxiv.org/abs/2205.14135
 
+        此Fast path就是指下面调用torch._transformer_encoder_layer_fwd; 引用FlashAttention论文是因为其融合kernel的注意力计算(_native_multi_head_attention)采用了论文提出的IO-aware融合注意力技术(调用at::native::scaled_dot_product_attention),而整层融合进一步省去Python逐算子调度的开销;
+        但其实非Fast path路径(self._sa_block)涉及的MultiheadAttention内部也会走scaled_dot_product_attention;
+            TransformerEncoderLayer.forward
+            │
+            ├─【路径1：layer 级 fast path】条件最苛刻
+            │    torch._transformer_encoder_layer_fwd          ← 整层融合（MHA+残差+LN+FFN 一次 C++ 调用）
+            │      └─ aten/.../transformer.cpp
+            │           └─ _native_multi_head_attention
+            │                └─ SDPA → flash / efficient / cudnn / math
+            │
+            └─【路径2/3：慢速路径】_sa_block → MultiheadAttention.forward
+                │
+                ├─【路径2：MHA 级 fastpath】条件次苛刻（self-attn、batch_first、eval、无梯度…）
+                │    torch._native_multi_head_attention        ← 仅MHA
+                │      └─ SDPA → flash / efficient / cudnn / math
+                │
+                └─【路径3：纯 Python 路径】
+                    F.multi_head_attention_forward
+                        └─ need_weights=False 时 → F.scaled_dot_product_attention
+                            └─ SDPA → flash / efficient / cudnn / math
     """
 
     __constants__ = ["norm_first"]
@@ -773,7 +793,7 @@ class TransformerEncoderLayer(Module):
         )
         # Implementation of Feedforward model
         self.linear1 = Linear(d_model, dim_feedforward, bias=bias, **factory_kwargs)
-        self.dropout = Dropout(dropout)         # Dropout无状态,故:若self.dropout,self.dropout1,self.dropout2共用一个实例时,计算结果等价；但分开实例能保证独立配置p;
+        self.dropout = Dropout(dropout)    # Dropout无状态,故:若self.dropout,self.dropout1,self.dropout2共用一个实例时,计算结果等价；但分开实例能保证独立配置p;
         self.linear2 = Linear(dim_feedforward, d_model, bias=bias, **factory_kwargs)
 
         self.norm_first = norm_first
@@ -788,7 +808,7 @@ class TransformerEncoderLayer(Module):
 
         # We can't test self.activation in forward() in TorchScript,
         # so stash some information about it instead.
-        if activation is F.relu or isinstance(activation, torch.nn.ReLU):
+        if activation is F.relu or isinstance(activation, torch.nn.ReLU):   # F.relu是函数,nn.ReLU是封装它的Module子类；
             self.activation_relu_or_gelu = 1
         elif activation is F.gelu or isinstance(activation, torch.nn.GELU):
             self.activation_relu_or_gelu = 2
@@ -823,7 +843,7 @@ class TransformerEncoderLayer(Module):
                 compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.
+            see the docs in :class:`~torch.nn.Transformer`.     forward返回值的形状与输入src完全相同
         """
         src_key_padding_mask = F._canonical_mask(
             mask=src_key_padding_mask,
@@ -923,8 +943,8 @@ class TransformerEncoderLayer(Module):
                 merged_mask, mask_type = self.self_attn.merge_masks(
                     src_mask, src_key_padding_mask, src
                 )
-                return torch._transformer_encoder_layer_fwd(
-                    src,
+                return torch._transformer_encoder_layer_fwd( # aten/src/ATen/native/transformers/transformer.cpp中的transformer_encoder_layer_forward有调用:_native_multi_head_attention
+                    src,                                     # 继续参考torch/nn/modules/activation.py的MultiheadAttention部分:fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention
                     self.self_attn.embed_dim,
                     self.self_attn.num_heads,
                     self.self_attn.in_proj_weight,

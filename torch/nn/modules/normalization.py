@@ -203,7 +203,7 @@ class LayerNorm(Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         if self.elementwise_affine:
-            self.weight = Parameter(
+            self.weight = Parameter(        # 对应到"关于LayerNorm"中的公式上:weight就是γ,bias就是β,它们的shape都是(normalized_shape,)
                 torch.empty(self.normalized_shape, **factory_kwargs)
             )
             if bias:

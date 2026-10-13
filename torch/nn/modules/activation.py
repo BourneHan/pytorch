@@ -1157,7 +1157,7 @@ class MultiheadAttention(Module):
         >>> multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
         >>> attn_output, attn_output_weights = multihead_attn(query, key, value)            nn.Module.__call__: 1 执行必要的hook逻辑; 2 调用forward(query, key, value);
 
-    .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:
+    .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`:      FlashAttention是指at::native::scaled_dot_product_attention中的SDPBackend::flash_attention实现(efficient_attention属于同一IO-aware技术家族的另一篇论文)
          https://arxiv.org/abs/2205.14135
 
     """
