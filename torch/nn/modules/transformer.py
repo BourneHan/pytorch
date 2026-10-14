@@ -242,13 +242,13 @@ class Transformer(Module):
             - src: :math:`(S, E)` for unbatched input, :math:`(S, N, E)` if `batch_first=False` or
               `(N, S, E)` if `batch_first=True`.
             - tgt: :math:`(T, E)` for unbatched input, :math:`(T, N, E)` if `batch_first=False` or
-              `(N, T, E)` if `batch_first=True`.
-            - src_mask: :math:`(S, S)` or :math:`(N\cdot\text{num\_heads}, S, S)`.
-            - tgt_mask: :math:`(T, T)` or :math:`(N\cdot\text{num\_heads}, T, T)`.
-            - memory_mask: :math:`(T, S)`.
-            - src_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.
-            - tgt_key_padding_mask: :math:`(T)` for unbatched input otherwise :math:`(N, T)`.
-            - memory_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.
+              `(N, T, E)` if `batch_first=True`.                                       src_mask&tgt_mask仅用于自注意力机制且可全batch共享,因其是结构性规则:位置i只能看0..i,对batch里每条都一样;
+            - src_mask: :math:`(S, S)` or :math:`(N\cdot\text{num\_heads}, S, S)`.                  encoder自注意力的位置对掩码(多数任务不用,传None);
+            - tgt_mask: :math:`(T, T)` or :math:`(N\cdot\text{num\_heads}, T, T)`.                  decoder自注意力的因果掩码(训练时必需,否则泄漏); 
+            - memory_mask: :math:`(T, S)`.                                                          decoder的cross attention的位置对掩码(极少用);
+            - src_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.       encoder自注意力时指定key中的padding; query无需指定padding,因padding的输出虽是垃圾,却无害,可由ignore_index处理;
+            - tgt_key_padding_mask: :math:`(T)` for unbatched input otherwise :math:`(N, T)`.       decoder自注意力时指定key中的padding;
+            - memory_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.    decoder的cross attention时指定key中的padding;
 
             Note: [src/tgt/memory]_mask ensures that position :math:`i` is allowed to attend the unmasked
             positions. If a BoolTensor is provided, positions with ``True``
@@ -767,6 +767,7 @@ class TransformerEncoderLayer(Module):
 
     __constants__ = ["norm_first"]
 
+    # 已看完
     def __init__(
         self,
         d_model: int,
@@ -807,7 +808,7 @@ class TransformerEncoderLayer(Module):
             activation = _get_activation_fn(activation)
 
         # We can't test self.activation in forward() in TorchScript,
-        # so stash some information about it instead.
+        # so stash some information about it instead.   stash:verb:to put by or away as for safekeeping or future use, usually in a secret place (usually followed byaway ).
         if activation is F.relu or isinstance(activation, torch.nn.ReLU):   # F.relu是函数,nn.ReLU是封装它的Module子类；
             self.activation_relu_or_gelu = 1
         elif activation is F.gelu or isinstance(activation, torch.nn.GELU):
@@ -816,6 +817,7 @@ class TransformerEncoderLayer(Module):
             self.activation_relu_or_gelu = 0
         self.activation = activation
 
+    # 已看完
     def __setstate__(self, state):
         super().__setstate__(state)
         if not hasattr(self, "activation"):
@@ -827,13 +829,13 @@ class TransformerEncoderLayer(Module):
         src_mask: Tensor | None = None,
         src_key_padding_mask: Tensor | None = None,
         is_causal: bool = False,
-    ) -> Tensor:
+    ) -> Tensor:        # forward返回值的形状与输入src完全相同
         r"""Pass the input through the encoder layer.
 
         Args:
             src: the sequence to the encoder layer (required).
             src_mask: the mask for the src sequence (optional).
-            src_key_padding_mask: the mask for the src keys per batch (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).   应是遵循上面:src_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.
             is_causal: If specified, applies a causal mask as ``src mask``.
                 Default: ``False``.
                 Warning:
@@ -843,7 +845,7 @@ class TransformerEncoderLayer(Module):
                 compatibility.
 
         Shape:
-            see the docs in :class:`~torch.nn.Transformer`.     forward返回值的形状与输入src完全相同
+            see the docs in :class:`~torch.nn.Transformer`.
         """
         src_key_padding_mask = F._canonical_mask(
             mask=src_key_padding_mask,
@@ -940,8 +942,8 @@ class TransformerEncoderLayer(Module):
                 )
 
             if not why_not_sparsity_fast_path:
-                merged_mask, mask_type = self.self_attn.merge_masks(
-                    src_mask, src_key_padding_mask, src
+                merged_mask, mask_type = self.self_attn.merge_masks(    # 因为是在TransformerEncoderLayer即在encoder中,故此处仅涉及self-attention的计算
+                    src_mask, src_key_padding_mask, src                 # 而由上面elif src.dim() != 3知此处必为batched
                 )
                 return torch._transformer_encoder_layer_fwd( # aten/src/ATen/native/transformers/transformer.cpp中的transformer_encoder_layer_forward有调用:_native_multi_head_attention
                     src,                                     # 继续参考torch/nn/modules/activation.py的MultiheadAttention部分:fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention
@@ -1227,7 +1229,8 @@ def _get_clones(module, N):
     return ModuleList([copy.deepcopy(module) for i in range(N)])    # Lists may be constructed in several ways:Using a list comprehension: [x for x in iterable]
                                                                     # range(stop)
 
-def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:
+# 已看完
+def _get_activation_fn(activation: str) -> Callable[[Tensor], Tensor]:  # 返回一个可调用对象:接收一个Tensor,返回一个Tensor
     if activation == "relu":
         return F.relu
     elif activation == "gelu":

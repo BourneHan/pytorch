@@ -1186,7 +1186,7 @@ class MultiheadAttention(Module):
                 f"embed_dim and num_heads must be greater than 0,"
                 f" got embed_dim={embed_dim} and num_heads={num_heads} instead"
             )
-        factory_kwargs = {"device": device, "dtype": dtype} # 字典
+        factory_kwargs = {"device": device, "dtype": dtype} # 字典dictionary
         super().__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
@@ -1463,7 +1463,7 @@ class MultiheadAttention(Module):
                 fast_path_blocked_by_tracing = True
             if not why_not_fast_path:
                 merged_mask, mask_type = self.merge_masks(      # 上有:query与key/value不相同,则不能使用fast path,也就是:下面的_native_multi_head_attention只支持self-attention
-                    attn_mask, key_padding_mask, query
+                    attn_mask, key_padding_mask, query          # 由上面elif not is_batched:batched知此处必为batched
                 )
 
                 if self.in_proj_bias is not None and self.in_proj_weight is not None:
@@ -1571,7 +1571,7 @@ class MultiheadAttention(Module):
         self,
         attn_mask: Tensor | None,
         key_padding_mask: Tensor | None,
-        query: Tensor,
+        query: Tensor,                      # 外部调用保证了:仅用于self-attention情况下
     ) -> tuple[Tensor | None, int | None]:
         r"""Determine mask type and combine masks if necessary.
 
@@ -1611,10 +1611,10 @@ class MultiheadAttention(Module):
             merged_mask = attn_mask_expanded
 
             if key_padding_mask is not None:
-                key_padding_mask_expanded = key_padding_mask.view(
+                key_padding_mask_expanded = key_padding_mask.view(  # 外部调用保证了:必为batched
                     batch_size, 1, 1, seq_len                  # (N, S) → (N, 1, 1, S) 此处第2个1不用改为seq_len?不能,因上有:view仅重塑形状,其总元素数不变
                 ).expand(-1, self.num_heads, -1, -1)           # (N, 1, 1, S) → (N, H, 1, S) 
-                merged_mask = attn_mask_expanded + key_padding_mask_expanded    # (N, H, L, S) + (N, H, 1, S)  PyTorch广播规则:大小为1的维度自动扩展以匹配另一张量; key_padding_mask的语义是"key位置j是否padding"——与query位置i无关.
+                merged_mask = attn_mask_expanded + key_padding_mask_expanded    # (N, H, S, S) + (N, H, 1, S)  PyTorch广播规则:大小为1的维度自动扩展以匹配另一张量; key_padding_mask的语义是"key位置j是否padding"——与query位置i无关.
                                                                                     # "关于broadcasting"中类似有:If one of the dimensions is 1, it can be broadcast (stretched) to match the other.
         # no attn_mask and no key_padding_mask, returns None, None
         return merged_mask, mask_type
