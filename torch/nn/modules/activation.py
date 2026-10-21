@@ -1356,8 +1356,23 @@ class MultiheadAttention(Module):
             .. note::
                 `batch_first` argument is ignored for unbatched inputs.
         """
+        # TransformerEncoderLayer.forward与MultiheadAttention.forward中走各自的fast path时检查的内容基本相同;
+        # 两者共享约12条同源检查(因torch._transformer_encoder_layer_fwd中直接调用torch._native_multi_head_attention),差异由融合范围和独立演进造成;
+        # 	各自独有的检查(由融合范围决定)
+        # 		EncoderLayer独有(整层融合多出来的约束):
+        # 			activation_relu_or_gelu;
+        # 			norm1.eps != norm2.eps——kernel;
+        # 			hooks扫描;
+        # 		MHA独有(作为公共API的额外约束):
+        # 			query is not key or key is not value——两个融合算子仅支持self-attention;
+        # 			bias_k/bias_v/add_zero_attn——encoder layer构造时不用这些特性;
+        # 			dtype匹配检查——纯UX优化(反正都会响亮失败,给个好看的报错);
+        # 	三处漂移(同语义但不同步)
+        # 		浮点mask守卫;
+        # 		_is_make_fx_tracing;
+        # 		设备白名单含"xpu";
         why_not_fast_path = ""
-        if (
+        if (   # TransformerEncoderLayer.forward中没有同步补上这个检查
             (attn_mask is not None and torch.is_floating_point(attn_mask))
             or (key_padding_mask is not None)                               # Python中and的优先级高于or
             and torch.is_floating_point(key_padding_mask)
@@ -1402,10 +1417,12 @@ class MultiheadAttention(Module):
             why_not_fast_path = "non-self attention was used (query, key, and value are not the same Tensor)"
         elif self.in_proj_bias is not None and query.dtype != self.in_proj_bias.dtype:
             why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_bias ({self.in_proj_bias.dtype}) don't match"
-        elif self.in_proj_weight is None:
+        elif self.in_proj_weight is None:   # in_proj_weight is None时会用分离的q/k/v权重
             why_not_fast_path = "in_proj_weight was None"
         elif query.dtype != self.in_proj_weight.dtype:  # fast path使用的原生融合算子不会在内部做自动类型转换(因为类型转换会带来额外开销,违背fast path的性能目标),所以必须要求query和in_proj_weight的dtype完全一致
             # this case will fail anyway, but at least they'll get a useful error message.
+            #   dtype不匹配时(包含上面query.dtype != self.in_proj_bias.dtype),在下面任何路径(torch._native_multi_head_attention及F.multi_head_attention_forward)下都会响亮失败(loud failure); MHA作为直接面向终端用户的公共API,值得在Python侧提前给出带具体dtype的清晰消息;
+            #   TransformerEncoderLayer.forward中:torch._transformer_encoder_layer_fwd/self._sa_block(MultiheadAttention.forward)类似也会响亮失败(loud failure); 
             why_not_fast_path = f"dtypes of query ({query.dtype}) and self.in_proj_weight ({self.in_proj_weight.dtype}) don't match"
         elif self.training:
             why_not_fast_path = "training is enabled"
@@ -1421,10 +1438,10 @@ class MultiheadAttention(Module):
             why_not_fast_path = "add_zero_attn was enabled"
         elif not self._qkv_same_embed_dim:
             why_not_fast_path = "_qkv_same_embed_dim was not True"
-        elif query.is_nested and (  # 上有:# query与key/value不相同,则不能使用fast path
-            key_padding_mask is not None or attn_mask is not None
-        ):
-            why_not_fast_path = (
+        elif query.is_nested and (  # 到此处则:query,key,value相同,因上有:elif query is not key or key is not value:  # query与key/value不相同,则不能使用fast path
+            key_padding_mask is not None or attn_mask is not None   # NestedTensor的jagged结构已经完整编码了"哪些是padding",故无需key_padding_mask
+        ):          # nested输入的注意力分数矩阵是锯齿(ragged)的——每个样本的query/key长度不同,不存在规则的(L, S)或(N·H, L, S)稠密矩阵;而attn_mask恰好是稠密的(L, S)或(N·H, L, S)形状,无法与ragged布局建立位置对应;
+            why_not_fast_path = (   # 报错信息有误,应为任一非None即触发
                 "supplying both src_key_padding_mask and src_mask at the same time \
                                  is not supported with NestedTensor input"
             )
@@ -1444,9 +1461,9 @@ class MultiheadAttention(Module):
             )
             # We have to use list comprehensions below because TorchScript does not support
             # generator expressions.
-            if torch.overrides.has_torch_function(tensor_args):
+            if torch.overrides.has_torch_function(tensor_args): # __torch_function__协议
                 why_not_fast_path = "some Tensor argument has_torch_function"
-            elif not all(_check_arg_device(x) for x in tensor_args):
+            elif not all(_check_arg_device(x) for x in tensor_args):    #  少了TransformerEncoderLayer.forward中_supported_device_type中的xpu(没有同步更新)
                 why_not_fast_path = (
                     "some Tensor argument's device is neither one of "
                     f"cpu, cuda or {torch.utils.backend_registration._privateuse1_backend_name}"
@@ -1458,14 +1475,14 @@ class MultiheadAttention(Module):
                     "grad is enabled and at least one of query or the "
                     "input/output projection weights or biases requires_grad"
                 )
-            elif _is_make_fx_tracing():
+            elif _is_make_fx_tracing(): # TransformerEncoderLayer.forward中没有同步补上这个检查
                 why_not_fast_path = "we are running make_fx tracing"
                 fast_path_blocked_by_tracing = True
             if not why_not_fast_path:
                 merged_mask, mask_type = self.merge_masks(      # 上有:query与key/value不相同,则不能使用fast path,也就是:下面的_native_multi_head_attention只支持self-attention
                     attn_mask, key_padding_mask, query          # 由上面elif not is_batched:batched知此处必为batched
                 )
-
+                # TransformerEncoderLayer.forward中对应有:elif self.self_attn.in_proj_bias is None及elif not self.self_attn._qkv_same_embed_dim(上有:if self._qkv_same_embed_dim: xavier_uniform_(self.in_proj_weight))
                 if self.in_proj_bias is not None and self.in_proj_weight is not None:
                     return torch._native_multi_head_attention(  # native融合算子,里面有:query shape: [B, T, D]; 对照下面调用的multi_head_attention_forward有:query: :math:`(L, E)` or :math:`(L, N, E)`
                         query,                                  # 不支持下面调用的multi_head_attention_forward支持的bias_k/bias_v,add_zero_attn(上有:_native_multi_head_attention偏inference)

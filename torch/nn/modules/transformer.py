@@ -338,7 +338,7 @@ class TransformerEncoder(Module):
 
     .. warning::
         All layers in the TransformerEncoder are initialized with the same parameters.
-        It is recommended to manually initialize the layers after creating the TransformerEncoder instance.
+        It is recommended to manually initialize the layers after creating the TransformerEncoder instance. ???
 
     Args:
         encoder_layer: an instance of the TransformerEncoderLayer() class (required).
@@ -370,8 +370,8 @@ class TransformerEncoder(Module):
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
-        # this attribute saves the value providedat object construction
-        self.enable_nested_tensor = enable_nested_tensor
+        # this attribute saves the value provided at object construction
+        self.enable_nested_tensor = enable_nested_tensor    # 保留enable_nested_tensor的原始配置,当前后续未使用
         # this attribute controls whether nested tensors are used
         self.use_nested_tensor = enable_nested_tensor
         self.mask_check = mask_check
@@ -452,7 +452,7 @@ class TransformerEncoder(Module):
             check_other=False,
         )
 
-        output = src
+        output = src    # 此处output与src指向同一个Tensor对象; 下面执行output = torch._nested_tensor_from_mask(/output = mod(/其它时,会让其指向其他Tensor;
         convert_to_nested = False
         first_layer = self.layers[0]
         src_key_padding_mask_for_layers = src_key_padding_mask
@@ -478,19 +478,19 @@ class TransformerEncoder(Module):
             why_not_sparsity_fast_path = (
                 f"input not batched; expected src.dim() of 3 but got {src.dim()}"
             )
-        elif src_key_padding_mask is None:
+        elif src_key_padding_mask is None:  # 下面_nested_tensor_from_mask需要src_key_padding_mask
             why_not_sparsity_fast_path = "src_key_padding_mask was None"
         # This check avoids a call to torch._nested_tensor_from_mask_left_aligned() that
-        # breaks in torch.compile.
+        # breaks in torch.compile.   # torch._nested_tensor_from_mask_left_aligned内部有数据依赖的控制流,在torch.compile/export下会图断裂,故编译模式下直接放弃nested转换
         elif do_mask_check and torch.compiler.is_compiling():
             why_not_sparsity_fast_path = (
                 "mask_check enabled with torch.compile or torch.export"
             )
-        elif do_mask_check and not torch._nested_tensor_from_mask_left_aligned(
+        elif do_mask_check and not torch._nested_tensor_from_mask_left_aligned( # 这张mask能否合法地把这个src转成nested:每条序列的有效token全部集中在左侧、padding全部在右侧
             src, src_key_padding_mask.logical_not()
         ):
             why_not_sparsity_fast_path = "mask_check enabled, and src and src_key_padding_mask was not left aligned"
-        elif output.is_nested:
+        elif output.is_nested:  # 下面_nested_tensor_from_mask无意义,但NestedTensor的out通过下面的mod(...)调用仍会传给TransformerEncoderLayer.forward
             why_not_sparsity_fast_path = "NestedTensor input is not supported"
         elif mask is not None:
             why_not_sparsity_fast_path = (
@@ -535,12 +535,12 @@ class TransformerEncoder(Module):
 
             if (not why_not_sparsity_fast_path) and (src_key_padding_mask is not None):
                 convert_to_nested = True
-                output = torch._nested_tensor_from_mask(  ???为啥这个函数的调用使用why_not_sparsity_fast_path来判断???
+                output = torch._nested_tensor_from_mask(  ???为啥这个函数的调用使用why_not_sparsity_fast_path来判断??? # mask_check=False执行转换——不重复_nested_tensor_from_mask_left_aligned进行的校验
                     output, src_key_padding_mask.logical_not(), mask_check=False
                 )
                 src_key_padding_mask_for_layers = None
 
-        seq_len = _get_seq_len(src, batch_first)
+        seq_len = _get_seq_len(src, batch_first) # 获取输入序列的长度
         is_causal = _detect_is_causal_mask(mask, is_causal, seq_len)
 
         for mod in self.layers:
@@ -723,7 +723,7 @@ class TransformerEncoderLayer(Module):
         conditions are met:
 
         - Either autograd is disabled (using ``torch.inference_mode`` or ``torch.no_grad``) or no tensor    对应下面的elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args)的逻辑取反
-          argument ``requires_grad``
+          argument ``requires_grad``                                                                        autograd的建图规则是:一个操作被记录到计算图,当且仅当grad模式开启AND至少一个输入requires_grad=True
         - training is disabled (using ``.eval()``)              对应下面的elif self.training的逻辑取反;   "推理"只描述模型被使用这一事实,不排斥梯度:梯度可以作为分析工具,还可以驱动真正的参数更新; 建图由grad模式+requires_grad在前向时隐式控制; backward由用户显式调用触发; 参数更新由optimizer.step()独立完成;
         - batch_first is ``True`` and the input is batched (i.e., ``src.dim() == 3``)
         - activation is one of: ``"relu"``, ``"gelu"``, ``torch.functional.relu``, or ``torch.functional.gelu``
@@ -875,7 +875,7 @@ class TransformerEncoderLayer(Module):
             why_not_sparsity_fast_path = (
                 f"input not batched; expected src.dim() of 3 but got {src.dim()}"
             )
-        elif self.training:
+        elif self.training: # 训练语义需要:1.融合kernel(_transformer_encoder_layer_fwd)没有的反向传播实现; 2.融合kernel(_transformer_encoder_layer_fwd)不执行的dropout;
             why_not_sparsity_fast_path = "training is enabled"
         elif not self.self_attn.batch_first:
             why_not_sparsity_fast_path = "self_attn.batch_first was not True"
@@ -883,23 +883,28 @@ class TransformerEncoderLayer(Module):
             why_not_sparsity_fast_path = "self_attn was passed bias=False"
         elif not self.self_attn._qkv_same_embed_dim:
             why_not_sparsity_fast_path = "self_attn._qkv_same_embed_dim was not True"
-        elif not self.activation_relu_or_gelu:
+        elif not self.activation_relu_or_gelu:  # MultiheadAttention.forward中调用的torch._native_multi_head_attention不涉及激活
             why_not_sparsity_fast_path = "activation_relu_or_gelu was not True"
-        elif self.norm1.eps != self.norm2.eps:
+        elif self.norm1.eps != self.norm2.eps:  # MultiheadAttention.forward中调用的torch._native_multi_head_attention不涉及norm
             why_not_sparsity_fast_path = "norm1.eps is not equal to norm2.eps"
-        elif src.is_nested and (
-            src_key_padding_mask is not None or src_mask is not None
-        ):
+        elif src.is_nested and (                ???到此为止???
+            src_key_padding_mask is not None or src_mask is not None    # NestedTensor的jagged结构已经完整编码了"哪些是padding",故无需src_key_padding_mask
+        ):  # nested输入的注意力分数矩阵是锯齿(ragged)的——每个样本的query/key长度不同,不存在规则的(S, S)或(N·H, S, S)稠密矩阵;而src_mask恰好是稠密的(S, S)或(N·H, S, S)形状,无法与ragged布局建立位置对应;
             why_not_sparsity_fast_path = "neither src_key_padding_mask nor src_mask are not supported with NestedTensor input"
         elif self.self_attn.num_heads % 2 == 1:
             why_not_sparsity_fast_path = "num_head is odd"
         elif torch.is_autocast_enabled():
             why_not_sparsity_fast_path = "autocast is enabled"
-        elif any(
+            # Autocast(自动混合精度)自动把"适合低精度"的算子(matmul、conv等)的输入转成fp16/bf16计算,其余算子保持fp32——用更低的显存和更快的Tensor Core吞吐加速,同时维持数值稳定性.
+            #     白名单机制:框架内置算子级策略——matmul/linear/conv进fp16(计算密集、精度容忍高); LayerNorm/softmax/求和类保持fp32(归约易溢出);
+            #     自动插入cast:进入算子前按策略把输入cast到目标精度,输出dtype由策略决定,用户无需手动;
+        elif any(   # any里面是省略了()的生成器表达式
             len(getattr(m, "_forward_hooks", {}))
             + len(getattr(m, "_forward_pre_hooks", {}))
-            for m in self.modules()
-        ):
+            for m in self.modules() # 遍历本层及其所有子模块(self、self_attn、linear1、linear2、norm1、norm2、各Dropout等),只要任何一个挂了forward hook或forward pre-hook,就拒绝走融合kernel;
+        ):                          # 融合kernel(下面调用的torch._transformer_encoder_layer_fwd)会绕过Python调用链而省略用户回调;
+            # MultiheadAttention.forward中调用torch._native_multi_head_attention前没类似检查,因为:
+	        #   MHA的fast path与slow path在hook语义上完全一致:MHA的慢速路径本身就不会触发任何子模块hook,F.multi_head_attention_forward内部全部用F.linear等函数式接口——self.out_proj这个子模块的__call__从未被调用;
             why_not_sparsity_fast_path = "forward pre-/hooks are attached to the module"
         if not why_not_sparsity_fast_path:
             tensor_args = (
@@ -926,7 +931,7 @@ class TransformerEncoderLayer(Module):
                 "xpu",
                 torch.utils.backend_registration._privateuse1_backend_name,
             ]
-            if torch.overrides.has_torch_function(tensor_args):
+            if torch.overrides.has_torch_function(tensor_args): # __torch_function__协议
                 why_not_sparsity_fast_path = "some Tensor argument has_torch_function"
             elif not all(
                 (x.device.type in _supported_device_type) for x in tensor_args
@@ -936,7 +941,7 @@ class TransformerEncoderLayer(Module):
                     f"{_supported_device_type}"
                 )
             elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
-                why_not_sparsity_fast_path = (
+                why_not_sparsity_fast_path = (  # torch._transformer_encoder_layer_fwd是C++融合kernel:MHA+残差+LayerNorm+FFN在一次调用内完成,没有对应的backward实现(反向需要的中间激活值在融合计算中被丢弃/未暴露)
                     "grad is enabled and at least one of query or the "
                     "input/output projection weights or biases requires_grad"
                 )
@@ -945,10 +950,10 @@ class TransformerEncoderLayer(Module):
                 merged_mask, mask_type = self.self_attn.merge_masks(    # 因为是在TransformerEncoderLayer即在encoder中,故此处仅涉及self-attention的计算
                     src_mask, src_key_padding_mask, src                 # 而由上面elif src.dim() != 3知此处必为batched
                 )
-                return torch._transformer_encoder_layer_fwd( # aten/src/ATen/native/transformers/transformer.cpp中的transformer_encoder_layer_forward有调用:_native_multi_head_attention
+                return torch._transformer_encoder_layer_fwd( # aten/src/ATen/native/transformers/transformer.cpp中的transformer_encoder_layer_forward直接调用:_native_multi_head_attention计算注意力
                     src,                                     # 继续参考torch/nn/modules/activation.py的MultiheadAttention部分:fastpath inference指的是在MultiheadAttention.forward中直接调用torch._native_multi_head_attention
-                    self.self_attn.embed_dim,
-                    self.self_attn.num_heads,
+                    self.self_attn.embed_dim,                # _transformer_encoder_layer_fwd是为推理优化:1.不保存反向所需的中间激活;2.也不实现dropout; MultiheadAttention.forward中的torch._native_multi_head_attention也是如此
+                    self.self_attn.num_heads,                # SDPA(at::native::scaled_dot_product_attention)是只融合了注意力核心的kernel,且其注册了backward;
                     self.self_attn.in_proj_weight,
                     self.self_attn.in_proj_bias,
                     self.self_attn.out_proj.weight,

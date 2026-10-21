@@ -759,7 +759,7 @@ std::tuple<Tensor, Tensor> native_multi_head_attention_cuda(
       query.is_nested() || key.is_nested() || value.is_nested() ||
           (query.sizes() == key.sizes() && key.sizes() == value.sizes()), // 这个检查只在非nested情况下要求query/key/value形状完全相同
       "expected `query`/`key`/`value` shapes to match");                  // 这个fast path只支持self-attention(T_q == T_kv);
-  TORCH_CHECK(                                                            // Cross-attention会走慢速路径(Python层的MultiheadAttention.forward)???
+  TORCH_CHECK(                                                            // Cross-attention会走慢速路径(Python层的MultiheadAttention.forward的其余分支)
       qkv_weight.dim() == 2,
       "expected 2-D `qkv_weight`, got ",
       qkv_weight.dim(),
