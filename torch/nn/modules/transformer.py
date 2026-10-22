@@ -380,28 +380,32 @@ class TransformerEncoder(Module):
         why_not_sparsity_fast_path = ""
         if not isinstance(encoder_layer, torch.nn.TransformerEncoderLayer):
             why_not_sparsity_fast_path = f"{enc_layer} was not TransformerEncoderLayer"
+        # TransformerEncoderLayer.forward中why_not_sparsity_fast_path没有对norm_first的检查,因为_transformer_encoder_layer_fwd对pre/post-norm都实现了;
+        # 此处的检查是因为pre-norm要求融合kernel(torch._transformer_encoder_layer_fwd)内部显式维护类似于x + self._sa_block(self.norm1(x), ...)两条线,这需要单独实现和验证,于是对其在栈级保守关闭nested转换.
+        #   post-norm(BERT系)实现和验证过;
+        #   post-norm是单流管线,pre-norm是分叉-汇合(fork-join)结构??？;而nested输入把这个实现负担进一步放大;
         elif encoder_layer.norm_first:
             why_not_sparsity_fast_path = f"{enc_layer}.norm_first was True"
-        elif not encoder_layer.self_attn.batch_first:
+        elif not encoder_layer.self_attn.batch_first:   # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = (
                 f"{enc_layer}.self_attn.batch_first was not True"
                 + "(use batch_first for better inference performance)"
             )
-        elif not encoder_layer.self_attn._qkv_same_embed_dim:
+        elif not encoder_layer.self_attn._qkv_same_embed_dim:   # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = (
                 f"{enc_layer}.self_attn._qkv_same_embed_dim was not True"
             )
-        elif encoder_layer.self_attn.in_proj_bias is None:
+        elif encoder_layer.self_attn.in_proj_bias is None:  # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = f"{enc_layer}.self_attn was passed bias=False"
-        elif not encoder_layer.activation_relu_or_gelu:
+        elif not encoder_layer.activation_relu_or_gelu: # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = (
                 f"{enc_layer}.activation_relu_or_gelu was not True"
             )
-        elif encoder_layer.norm1.eps != encoder_layer.norm2.eps:
+        elif encoder_layer.norm1.eps != encoder_layer.norm2.eps:    # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = (
                 f"{enc_layer}.norm1.eps was not equal to {enc_layer}.norm2.eps"
             )
-        elif encoder_layer.self_attn.num_heads % 2 == 1:
+        elif encoder_layer.self_attn.num_heads % 2 == 1:    # 静态结构(构造后不变),在__init__中检查
             why_not_sparsity_fast_path = f"{enc_layer}.self_attn.num_heads is odd"
 
         if enable_nested_tensor and why_not_sparsity_fast_path:
@@ -454,7 +458,7 @@ class TransformerEncoder(Module):
 
         output = src    # 此处output与src指向同一个Tensor对象; 下面执行output = torch._nested_tensor_from_mask(/output = mod(/其它时,会让其指向其他Tensor;
         convert_to_nested = False
-        first_layer = self.layers[0]
+        first_layer = self.layers[0]    # 查第一层是"各层通常同步"假设下的低开销;
         src_key_padding_mask_for_layers = src_key_padding_mask
         why_not_sparsity_fast_path = ""
         str_first_layer = "self.layers[0]"
@@ -472,9 +476,9 @@ class TransformerEncoder(Module):
             why_not_sparsity_fast_path = (
                 "self.use_nested_tensor (set in init) was not True"
             )
-        elif first_layer.training:
+        elif first_layer.training:  # 运行时状态(逐调用可变); 为什么不能用TransformerEncoder.training?语义权威性:决定TransformerEncoderLayer层的行为应是其自己的training属性;
             why_not_sparsity_fast_path = f"{str_first_layer} was in training mode"
-        elif src.dim() != 3:
+        elif src.dim() != 3:    # 运行时状态(逐调用可变)
             why_not_sparsity_fast_path = (
                 f"input not batched; expected src.dim() of 3 but got {src.dim()}"
             )
@@ -485,18 +489,18 @@ class TransformerEncoder(Module):
         elif do_mask_check and torch.compiler.is_compiling():
             why_not_sparsity_fast_path = (
                 "mask_check enabled with torch.compile or torch.export"
-            )
+            )                                                                   # 运行时状态(逐调用可变)
         elif do_mask_check and not torch._nested_tensor_from_mask_left_aligned( # 这张mask能否合法地把这个src转成nested:每条序列的有效token全部集中在左侧、padding全部在右侧
             src, src_key_padding_mask.logical_not()
         ):
             why_not_sparsity_fast_path = "mask_check enabled, and src and src_key_padding_mask was not left aligned"
         elif output.is_nested:  # 下面_nested_tensor_from_mask无意义,但NestedTensor的out通过下面的mod(...)调用仍会传给TransformerEncoderLayer.forward
             why_not_sparsity_fast_path = "NestedTensor input is not supported"
-        elif mask is not None:
+        elif mask is not None:  # 运行时状态(逐调用可变)
             why_not_sparsity_fast_path = (
                 "src_key_padding_mask and mask were both supplied"
             )
-        elif torch.is_autocast_enabled():
+        elif torch.is_autocast_enabled():   # 运行时状态(逐调用可变)
             why_not_sparsity_fast_path = "autocast is enabled"
 
         if not why_not_sparsity_fast_path:
@@ -527,7 +531,7 @@ class TransformerEncoder(Module):
                 why_not_sparsity_fast_path = (
                     f"src device is neither one of {_supported_device_type}"
                 )
-            elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args):
+            elif torch.is_grad_enabled() and any(x.requires_grad for x in tensor_args): # 运行时状态(逐调用可变)
                 why_not_sparsity_fast_path = (
                     "grad is enabled and at least one of query or the "
                     "input/output projection weights or biases requires_grad"
