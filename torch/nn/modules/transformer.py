@@ -243,13 +243,13 @@ class Transformer(Module):
               `(N, S, E)` if `batch_first=True`.
             - tgt: :math:`(T, E)` for unbatched input, :math:`(T, N, E)` if `batch_first=False` or
               `(N, T, E)` if `batch_first=True`.                                       src_mask&tgt_mask仅用于自注意力机制且可全batch共享,因其是结构性规则:位置i只能看0..i,对batch里每条都一样;
-            - src_mask: :math:`(S, S)` or :math:`(N\cdot\text{num\_heads}, S, S)`.                  encoder自注意力的位置对掩码(多数任务不用,传None);
-            - tgt_mask: :math:`(T, T)` or :math:`(N\cdot\text{num\_heads}, T, T)`.                  decoder自注意力的因果掩码(训练时必需,否则泄漏); 
-            - memory_mask: :math:`(T, S)`.                                                          decoder的cross attention的位置对掩码(极少用);
+            - src_mask: :math:`(S, S)` or :math:`(N\cdot\text{num\_heads}, S, S)`.                  encoder自注意力的位置对掩码(多数任务不用,传None); unbatched: (S, S); batched: (N * num_heads, S, S);
+            - tgt_mask: :math:`(T, T)` or :math:`(N\cdot\text{num\_heads}, T, T)`.                  decoder自注意力的因果掩码(训练时必需,否则泄漏);
+            - memory_mask: :math:`(T, S)`.                                                          decoder的cross attention的位置对掩码(极少用);  'memory'应是指用于cross attention
             - src_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.       encoder自注意力时指定key中的padding; query无需指定padding,因padding的输出虽是垃圾,却无害,可由ignore_index处理;
             - tgt_key_padding_mask: :math:`(T)` for unbatched input otherwise :math:`(N, T)`.       decoder自注意力时指定key中的padding;
             - memory_key_padding_mask: :math:`(S)` for unbatched input otherwise :math:`(N, S)`.    decoder的cross attention时指定key中的padding;
-
+                ?为什么上面这3个不需要像src_mask/tgt_mask那样指定num_heads维度?因为key_padding_mask是针对每个样本的padding位置,与多头无关,每个head都共享同样的mask。
             Note: [src/tgt/memory]_mask ensures that position :math:`i` is allowed to attend the unmasked
             positions. If a BoolTensor is provided, positions with ``True``
             are not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
@@ -359,9 +359,9 @@ class TransformerEncoder(Module):
 
     def __init__(
         self,
-        encoder_layer: "TransformerEncoderLayer",
-        num_layers: int,
-        norm: Module | None = None,
+        encoder_layer: "TransformerEncoderLayer", # 函数参数的类型注解; :后面是类型说明,这里表示它预期是TransformerEncoderLayer类型的对象; 类型名加引号,是前向引用.
+        num_layers: int,                          #   定义TransformerEncoder时,TransformerEncoderLayer类还没定义; 加引号后,Python会先把注解当作字符串保存,避免定义函数时因名称尚不存在而报错.  
+        norm: Module | None = None,               #   类型注解通常用于IDE提示、静态类型检查和文档说明; 它本身不会自动检查传入的对象类型.  
         enable_nested_tensor: bool = True,
         mask_check: bool = True,
     ) -> None:
@@ -791,7 +791,7 @@ class TransformerEncoderLayer(Module):
         self.self_attn = MultiheadAttention(
             d_model,
             nhead,
-            dropout=dropout,    # torch/nn/functional.py的multi_head_attention_forward中有:在softmax之后应用了dropout;
+            dropout=dropout,    # MultiheadAttention.forward使用的(torch/nn/functional.py中的)multi_head_attention_forward中有:在softmax之后应用了dropout;
             bias=bias,
             batch_first=batch_first,
             **factory_kwargs,
@@ -977,22 +977,24 @@ class TransformerEncoderLayer(Module):
                     mask_type,
                 )
 
+        # 此部分已OK
         # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
         x = src
-        if self.norm_first:
-            x = x + self._sa_block(
+        if self.norm_first: # 即Pre-LayerNorm
+            x = x + self._sa_block( # 计算self-attention
                 self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal
             )
-            x = x + self._ff_block(self.norm2(x))
-        else:
+            x = x + self._ff_block(self.norm2(x)) # 计算feed-forward网络
+        else: # 即Post-LayerNorm
             x = self.norm1(
                 x
                 + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal)
             )
             x = self.norm2(x + self._ff_block(x))
-
+        # 此部分已OK
         return x
 
+    # 已OK
     # self-attention block
     def _sa_block(
         self,
@@ -1001,7 +1003,7 @@ class TransformerEncoderLayer(Module):
         key_padding_mask: Tensor | None,
         is_causal: bool = False,
     ) -> Tensor:
-        x = self.self_attn(     # 上有:torch/nn/functional.py的multi_head_attention_forward中有:在softmax之后应用了dropout;
+        x = self.self_attn(     # 上有:MultiheadAttention.forward使用的(torch/nn/functional.py中的)multi_head_attention_forward中有:在softmax之后应用了dropout;
             x,
             x,
             x,
@@ -1012,6 +1014,7 @@ class TransformerEncoderLayer(Module):
         )[0]
         return self.dropout1(x)
 
+    # 已OK
     # feed forward block
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))

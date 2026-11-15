@@ -1285,6 +1285,7 @@ class MultiheadAttention(Module):
         super().__setstate__(state)
 
     # 已看完
+    # 输出符合下面_native_multi_head_attention调用的native_multi_head_attention_cuda的输出:最终注意力输出(proj_weight投影后的最终结果) + qkt注意力权重
     def forward(
         self,
         query: Tensor,
