@@ -1358,17 +1358,17 @@ class MultiheadAttention(Module):
                 `batch_first` argument is ignored for unbatched inputs.
         """
         # TransformerEncoderLayer.forward与MultiheadAttention.forward中走各自的fast path时检查的内容基本相同;
-        # 两者共享约12条同源检查(因torch._transformer_encoder_layer_fwd中直接调用torch._native_multi_head_attention),差异由融合范围和独立演进造成;
+        # 两者共享约12条同源检查(因torch._transformer_encoder_layer_fwd中直接调用torch._native_multi_head_attention进行注意力计算),差异由融合范围和独立演进造成;
         # 	各自独有的检查(由融合范围决定)
         # 		EncoderLayer独有(整层融合多出来的约束):
         # 			activation_relu_or_gelu;
         # 			norm1.eps != norm2.eps——kernel;
         # 			hooks扫描;
         # 		MHA独有(作为公共API的额外约束):
-        # 			query is not key or key is not value——两个融合算子仅支持self-attention;
+        # 			query is not key or key is not value——上述两个融合算子仅支持self-attention; torch._transformer_encoder_layer_fwd所在的TransformerEncoderLayer本身就仅有self-attention层;
         # 			bias_k/bias_v/add_zero_attn——encoder layer构造时不用这些特性;
         # 			dtype匹配检查——纯UX优化(反正都会响亮失败,给个好看的报错);
-        # 	三处漂移(同语义但不同步)
+        # 	三处漂移(同语义但不同步,即:独立演进)
         # 		浮点mask守卫;
         # 		_is_make_fx_tracing;
         # 		设备白名单含"xpu";

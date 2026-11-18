@@ -747,13 +747,13 @@ class TransformerEncoderLayer(Module):
         .. _`FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness`: 
          https://arxiv.org/abs/2205.14135
 
-        PyTorch的SDPA(含FlashAttention实现)是完整的softmax(QK^T/√d)V计算(而不仅仅是点积);
+        PyTorch的SDPA(含FlashAttention实现)是完整的softmax(QK^T/√d)V计算(而不仅仅是点积); SDPA不限制在self-attention/cross-attention下使用;
         scaled_dot_product_attention是SDPA的可调度入口,其后端实现包括flash_attention/efficient_attention/cudnn_attention/math等;
           上面_FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness:https://arxiv.org/abs/2205.14135 描述的是SDPA的一种高效实现方式;
             torch/nn/modules/activation.py中MultiheadAttention部分有:FlashAttention是指at::native::scaled_dot_product_attention中的SDPBackend::flash_attention实现
-          flash_attention实现会据device选择:_scaled_dot_product_flash_attention_cuda(CUDA后端的kernel)或_scaled_dot_product_flash_attention_for_cpu(CPU后端的kernel);
+          flash_attention的实现会据device选择:_scaled_dot_product_flash_attention_cuda(CUDA后端的kernel)或_scaled_dot_product_flash_attention_for_cpu(CPU后端的kernel);
             _scaled_dot_product_flash_attention_cuda(移植自Tri Dao的flash-attention库)会调用aten/src/ATen/native/transformers/cuda/flash_attn/flash_api.cpp中实现的mha_fwd/mha_bwd;
-        _native_multi_head_attention(native_multi_head_attention_cuda)在条件(纯self-attention(q/k/v是同一个tensor) & 不需要返回注意力权重)满足时会调用at::native::scaled_dot_product_attention;
+        _native_multi_head_attention(native_multi_head_attention_cuda)融合kernel在条件(纯self-attention(q/k/v是同一个tensor) & 不需要返回注意力权重)满足时会调用at::native::scaled_dot_product_attention;
               F.multi_head_attention_forward在条件(need_weights为False)满足时也会调用scaled_dot_product_attention;
 
         此Fast path就是指下面调用torch._transformer_encoder_layer_fwd,其融合kernel(transformer_encoder_layer_forward)直接调用_native_multi_head_attention进行注意力计算,而整层融合进一步省去Python逐算子调度的开销;
@@ -769,7 +769,7 @@ class TransformerEncoderLayer(Module):
             └─【路径2/3：慢速路径】_sa_block → MultiheadAttention.forward
                 │
                 ├─【路径2：MHA 级 fastpath】条件次苛刻（self-attn、batch_first、eval、无梯度…）
-                │    torch._native_multi_head_attention        ← 仅MHA
+                │    torch._native_multi_head_attention        ← 仅MHA融合
                 │      └─ 在条件满足时,调用at::native::scaled_dot_product_attention
                 │           └─ SDPA → flash / efficient / cudnn / math
                 │
@@ -1173,6 +1173,7 @@ class TransformerDecoderLayer(Module):
         """
         # see Fig. 1 of https://arxiv.org/pdf/2002.04745v1.pdf
 
+        # TransformerDecoderLayer的forward中没有torch._transformer_encoder_layer_fwd(整层融合(MHA+残差+LN+FFN 一次 C++ 调用))之类的调用
         x = tgt
         if self.norm_first:
             x = x + self._sa_block(
